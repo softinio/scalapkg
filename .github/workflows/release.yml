@@ -1,0 +1,68 @@
+# Copyright 2026 Salar Rahmanian
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish assembly jar
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Cache Mill and Coursier
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/mill
+            ~/.cache/coursier
+          key: ${{ runner.os }}-mill-${{ hashFiles('build.mill', '.mill-version') }}
+          restore-keys: |
+            ${{ runner.os }}-mill-
+
+      - name: Install Tailwind CSS CLI
+        run: npm ci
+
+      - name: Build assembly
+        run: ./mill --no-server backend.assembly
+
+      - name: Stage jar
+        run: |
+          mkdir -p dist
+          cp out/backend/assembly.dest/out.jar \
+             "dist/scalapkg-${GITHUB_REF_NAME}.jar"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/scalapkg-${GITHUB_REF_NAME}.jar" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

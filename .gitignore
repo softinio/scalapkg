@@ -1,0 +1,11 @@
+out/
+node_modules/
+.bsp/
+.metals/
+.bloop/
+*.bak
+.models/
+# old local seed with README text; the shared one is seed/seed.sql.gz
+.seed/
+# per-developer editor/agent MCP config
+.mcp.json

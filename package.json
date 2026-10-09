@@ -1,0 +1,9 @@
+{
+  "name": "scalapkg-styles",
+  "private": true,
+  "description": "Dev-time Tailwind CSS toolchain; the Nix devshell provides the standalone binary instead.",
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.3.2",
+    "tailwindcss": "^4.3.2"
+  }
+}

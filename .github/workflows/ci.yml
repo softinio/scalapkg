@@ -1,0 +1,117 @@
+# Copyright 2026 Salar Rahmanian
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Continuous Integration
+
+on:
+  pull_request:
+    branches: ['**']
+  push:
+    branches: ['**']
+    tags: [v*]
+
+concurrency:
+  group: ${{ github.workflow }} @ ${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # for the database tests (PackageRepoSuite) and the search evaluation
+    # (SearchEvalSuite, against the committed seed)
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: scalapkg
+          POSTGRES_DB: scalapkg
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U scalapkg"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout current branch
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Cache Mill and Coursier
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/mill
+            ~/.cache/coursier
+          key: ${{ runner.os }}-mill-${{ hashFiles('build.mill', '.mill-version') }}
+          restore-keys: |
+            ${{ runner.os }}-mill-
+
+      - name: Install Tailwind CSS CLI
+        run: npm ci
+
+      - name: Cache embedding model
+        uses: actions/cache@v6
+        with:
+          path: .models
+          key: bge-small-en-v1.5-5c38ec7c
+
+      - name: Fetch embedding model
+        run: |
+          mkdir -p .models/bge-small-en-v1.5 && cd .models/bge-small-en-v1.5
+          base=https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a
+          [ -f model.onnx ] || curl -fsSL -o model.onnx "$base/onnx/model.onnx"
+          [ -f vocab.txt ] || curl -fsSL -o vocab.txt "$base/vocab.txt"
+
+      - name: Load the dev seed
+        env:
+          PGHOST: localhost
+          PGUSER: scalapkg
+          PGDATABASE: scalapkg
+        run: |
+          psql -Xq -v ON_ERROR_STOP=1 -f backend/resources/db/migration/V1__init.sql
+          scripts/seed.sh load
+
+      - name: Compile
+        run: ./mill --no-server __.compile
+
+      - name: Check formatting
+        run: ./mill --no-server __.checkFormat
+
+      - name: Check scalafix lints
+        run: ./mill --no-server __.fix --check
+
+      - name: Test
+        env:
+          SCALAPKG_TEST_DB_PORT: 5432
+          SCALAPKG_EVAL_DB_PORT: 5432
+        run: ./mill --no-server __.test
+
+      - name: Build assembly
+        run: ./mill --no-server backend.assembly
+
+      - name: Upload assembly jar
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
+        with:
+          name: scalapkg-jar
+          path: out/backend/assembly.dest/out.jar

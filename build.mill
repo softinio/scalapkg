@@ -1,0 +1,220 @@
+//| mill-version: 1.1.10
+//| mill-jvm-version: system
+//| mill-jvm-opts:
+//| - --sun-misc-unsafe-memory-access=allow
+//| - --enable-native-access=ALL-UNNAMED
+//| mvnDeps:
+//| - com.goyeau::mill-scalafix::0.6.2
+
+/*
+ * Copyright 2026 Salar Rahmanian
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package build
+
+import com.goyeau.mill.scalafix.ScalafixModule
+import mill.*
+import mill.api.PathRef
+import mill.scalajslib.*
+import mill.scalajslib.api.ModuleKind
+import mill.scalalib.*
+import mill.scalalib.scalafmt.ScalafmtModule
+
+object versions {
+  val scala = "3.9.0"
+  val scalaJS = "1.22.0"
+
+  val cats = "2.13.0"
+  val catsEffect = "3.7.1"
+  val fs2 = "3.14.0"
+  val http4s = "1.0.0-M49"
+  val calico = "0.2.3"
+  val circe = "0.14.17"
+  val skunk = "1.0.0"
+  val dumbo = "0.11.0"
+  val ciris = "3.15.2"
+  val scalatags = "0.13.1"
+  val log4cats = "2.8.0"
+  val logback = "1.6.5"
+  val munit = "1.3.6"
+  val munitCatsEffect = "2.2.1"
+  val coursierVersions = "0.6.1"
+  val onnxruntime = "1.31.0"
+}
+
+/** Settings shared by every module: Scala version, warnings (fatal in CI),
+  * scalafmt and scalafix wiring.
+  */
+trait AppModule extends ScalaModule, ScalafmtModule, ScalafixModule {
+  def scalaVersion = versions.scala
+
+  // Task.Input re-reads the environment on every evaluation, so switching
+  // CI on/off correctly invalidates compilation
+  def insideCi = Task.Input { Task.env.contains("CI") }
+
+  def scalacOptions = Task {
+    Seq(
+      "-deprecation",
+      "-feature",
+      "-unchecked",
+      "-Wunused:all"
+    ) ++ (if (insideCi()) Seq("-Werror") else Seq())
+  }
+
+  // Lazy vals compiled before Scala 3.8 use sun.misc.Unsafe, and ONNX Runtime
+  // loads a native library; JDK 25 warns about both unless allowed. Pass the
+  // same flags to `java -jar` in production.
+  def forkArgs = Seq(
+    "--sun-misc-unsafe-memory-access=allow",
+    "--enable-native-access=ALL-UNNAMED"
+  )
+
+  trait AppTests extends ScalaTests, TestModule.Munit {
+    def mvnDeps = Seq(mvn"org.scalameta::munit::${versions.munit}")
+    def forkArgs = AppModule.this.forkArgs()
+  }
+}
+
+trait AppScalaJSModule extends AppModule, ScalaJSModule {
+  def scalaJSVersion = versions.scalaJS
+}
+
+/** Domain model, DTOs, JSON codecs and validation — cross-compiled so the
+  * backend and the Calico frontend share exactly the same types and codecs.
+  * Tests run on both platforms.
+  */
+object shared extends Module {
+  trait SharedModule extends AppModule, PlatformScalaModule {
+    def mvnDeps = Seq(
+      mvn"org.typelevel::cats-core::${versions.cats}",
+      mvn"io.circe::circe-core::${versions.circe}",
+      mvn"io.circe::circe-parser::${versions.circe}"
+    )
+
+    trait SharedTests extends AppTests {
+      // one shared test source tree, compiled for both platforms.
+      // PlatformScalaModule already strips the jvm/js segment, so moduleDir
+      // is shared/test here.
+      def sources = Task.Sources(moduleDir / "src")
+    }
+  }
+
+  object jvm extends SharedModule {
+    object test extends SharedTests
+  }
+
+  object js extends SharedModule, AppScalaJSModule {
+    object test extends SharedTests, ScalaJSTests
+  }
+}
+
+/** http4s server: server-rendered pages, JSON API, Postgres via skunk with
+  * dumbo migrations. The linked frontend bundle and the compiled Tailwind
+  * stylesheet are generated into this module's resources so the assembly
+  * jar is self-contained.
+  */
+object backend extends AppModule {
+  def moduleDeps = Seq(shared.jvm)
+
+  def mainClass = Some("com.softinio.scalapkg.Main")
+
+  def mvnDeps = Seq(
+    mvn"org.typelevel::cats-effect::${versions.catsEffect}",
+    mvn"co.fs2::fs2-core::${versions.fs2}",
+    mvn"co.fs2::fs2-io::${versions.fs2}",
+    mvn"co.fs2::fs2-scodec::${versions.fs2}",
+    mvn"org.http4s::http4s-dsl::${versions.http4s}",
+    mvn"org.http4s::http4s-ember-server::${versions.http4s}",
+    mvn"org.http4s::http4s-ember-client::${versions.http4s}",
+    mvn"org.http4s::http4s-circe::${versions.http4s}",
+    mvn"org.tpolecat::skunk-core::${versions.skunk}",
+    mvn"dev.rolang::dumbo::${versions.dumbo}",
+    mvn"is.cir::ciris::${versions.ciris}",
+    mvn"com.lihaoyi::scalatags::${versions.scalatags}",
+    mvn"org.typelevel::log4cats-slf4j::${versions.log4cats}",
+    mvn"io.get-coursier::versions:${versions.coursierVersions}",
+    // local sentence embeddings for semantic search
+    mvn"com.microsoft.onnxruntime:onnxruntime:${versions.onnxruntime}"
+  )
+
+  def runMvnDeps = Seq(
+    mvn"ch.qos.logback:logback-classic:${versions.logback}"
+  )
+
+  /** Compiles the Tailwind stylesheet. Binary resolution: TAILWINDCSS env
+    * var, then node_modules/.bin (npm install), then PATH (Nix devshell).
+    */
+  def tailwindCss = Task {
+    // class literals live in the Scala sources; re-run when they change
+    allSourceFiles()
+    frontend.allSourceFiles()
+    shared.jvm.allSourceFiles()
+    val input = moduleDir / os.up / "tailwind" / "app.css"
+    val out = Task.dest / "app.css"
+    val localBin = moduleDir / os.up / "node_modules" / ".bin" / "tailwindcss"
+    val bin = sys.env
+      .get("TAILWINDCSS")
+      .orElse(Option.when(os.exists(localBin))(localBin.toString))
+      .getOrElse("tailwindcss")
+    os.proc(bin, "-i", input.toString, "-o", out.toString, "--minify")
+      .call(cwd = moduleDir / os.up)
+    PathRef(out)
+  }
+
+  def resources = Task {
+    val assets = Task.dest / "public" / "assets"
+    os.makeDir.all(assets)
+    val report = frontend.fullLinkJS()
+    // the source map (~900 KB) is left out: only devtools would fetch it, and
+    // `watchFrontend` serves fastLinkJS with its maps during development
+    report.publicModules.foreach { m =>
+      os.copy(report.dest.path / m.jsFileName, assets / m.jsFileName)
+    }
+    os.copy(tailwindCss().path, assets / "app.css")
+    super.resources() ++ Seq(PathRef(Task.dest))
+  }
+
+  def assemblyRules = super.assemblyRules ++ Seq(
+    mill.scalalib.Assembly.Rule.ExcludePattern("META-INF/.*\\.(SF|DSA|RSA)"),
+    mill.scalalib.Assembly.Rule.ExcludePattern(".*module-info\\.class")
+  )
+
+  object test extends AppTests {
+    def mvnDeps = super.mvnDeps() ++ Seq(
+      mvn"org.typelevel::munit-cats-effect::${versions.munitCatsEffect}"
+    )
+
+    // the embedding test runs only when `fetchModel` has downloaded the model
+    def forkArgs = super.forkArgs() ++ Seq(
+      s"-Dscalapkg.modelDir=${moduleDir / os.up / os.up / ".models" / "bge-small-en-v1.5"}"
+    )
+  }
+}
+
+/** Calico islands mounted into server-rendered pages. NoModule keeps the
+  * Closure optimizer usable in fullLinkJS for a small bundle.
+  */
+object frontend extends AppScalaJSModule {
+  def moduleDeps = Seq(shared.js)
+
+  def mainClass = Some("com.softinio.scalapkg.ui.Main")
+
+  def moduleKind = ModuleKind.NoModule
+
+  def mvnDeps = Seq(
+    mvn"com.armanbilge::calico::${versions.calico}",
+    mvn"io.circe::circe-parser::${versions.circe}"
+  )
+}

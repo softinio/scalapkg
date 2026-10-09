@@ -1,0 +1,167 @@
+# Copyright 2026 Salar Rahmanian
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# https://numtide.github.io/devshell
+# https://numtide.github.io/devshell/getting_started.html
+
+[devshell]
+name = "scalapkg"
+# no nixpkgs mill: ./mill runs the version pinned in build.mill
+packages = [
+  "nodejs_22",
+  "tailwindcss_4",
+  "metals",
+  "scalafmt",
+]
+
+[[commands]]
+name = "fetchModel"
+category = "development"
+help = "Download the bge-small-en-v1.5 embedding model into .models/ (semantic search)"
+command = """\
+  mkdir -p .models/bge-small-en-v1.5 && cd .models/bge-small-en-v1.5 && \
+  base=https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a && \
+  ([ -f model.onnx ] || curl -fL -o model.onnx "$base/onnx/model.onnx") && \
+  ([ -f vocab.txt ] || curl -fL -o vocab.txt "$base/vocab.txt") && \
+  echo "model in $PWD (set SCALAPKG_EMBEDDINGS_MODEL_DIR to it)"
+"""
+
+[[commands]]
+name = "runTests"
+category = "development"
+help = "Run all tests (JVM + JS)"
+command = "./mill __.test"
+
+[[commands]]
+name = "runLint"
+category = "development"
+help = "Format code and apply scalafix rewrites"
+command = "./mill __.reformat && ./mill __.fix"
+
+[[commands]]
+name = "checkCI"
+category = "development"
+help = "Run the same checks CI runs (fatal warnings on)"
+command = """\
+  CI=true ./mill __.compile && ./mill __.checkFormat && ./mill __.fix --check && ./mill __.test
+"""
+
+[[commands]]
+name = "buildJar"
+category = "development"
+help = "Build the self-contained fat jar"
+command = "./mill backend.assembly && echo 'jar: out/backend/assembly.dest/out.jar'"
+
+[[commands]]
+name = "watchFrontend"
+category = "development"
+help = "Relink the Scala.js islands on every change (pair with SCALAPKG_DEV_ASSETS)"
+command = "./mill -w frontend.fastLinkJS"
+
+[[commands]]
+name = "startPostgres"
+category = "database"
+help = "Start PostgreSQL server for local development"
+command = """\
+  mkdir -p /tmp/postgres-scalapkg && \
+  [ -d /tmp/postgres-scalapkg/data ] || (initdb -D /tmp/postgres-scalapkg/data && \
+  echo "host all all 127.0.0.1/32 trust" >> /tmp/postgres-scalapkg/data/pg_hba.conf && \
+  echo "host all all ::1/128 trust" >> /tmp/postgres-scalapkg/data/pg_hba.conf) && \
+  pg_ctl -D /tmp/postgres-scalapkg/data -l /tmp/postgres-scalapkg.log start -o "-k /tmp/postgres-scalapkg" && \
+  sleep 1 && \
+  (psql -h localhost -d postgres -tc "SELECT 1 FROM pg_roles WHERE rolname='scalapkg'" | grep -q 1 || \
+   psql -h localhost -d postgres -c "CREATE USER scalapkg WITH SUPERUSER;") && \
+  (psql -h localhost -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='scalapkg'" | grep -q 1 || \
+   psql -h localhost -d postgres -c "CREATE DATABASE scalapkg OWNER scalapkg;")
+"""
+
+[[commands]]
+name = "stopPostgres"
+category = "database"
+help = "Stop PostgreSQL server"
+command = """\
+  pg_ctl -D /tmp/postgres-scalapkg/data stop
+"""
+
+[[commands]]
+name = "postgresStatus"
+category = "database"
+help = "Check PostgreSQL connection status"
+command = """\
+  pg_isready -h localhost || echo "PostgreSQL is not running"
+"""
+
+[[commands]]
+name = "saveSeed"
+category = "database"
+help = "Snapshot the local database's data into seed/seed.sql.gz (without READMEs)"
+command = "scripts/seed.sh save"
+
+[[commands]]
+name = "loadSeed"
+category = "database"
+help = "Replace the local database's data with seed/seed.sql.gz (run the server once first so migrations exist)"
+command = "scripts/seed.sh load"
+
+[[commands]]
+name = "resetDB"
+category = "database"
+help = "Drop and recreate the database (WARNING: destructive)"
+command = """\
+  psql -h localhost -d postgres -c "DROP DATABASE IF EXISTS scalapkg;" && \
+  psql -h localhost -d postgres -c "CREATE DATABASE scalapkg OWNER scalapkg;" && \
+  echo "Database reset; migrations run on next server start."
+"""
+
+[[commands]]
+name = "runDev"
+category = "development"
+help = "Start PostgreSQL and run the development server"
+command = """\
+  # Set up cleanup trap for Ctrl-C
+  cleanup() {
+    echo ""
+    echo "Shutting down services..."
+    pg_ctl -D /tmp/postgres-scalapkg/data stop 2>/dev/null || true
+    echo "Services stopped."
+    exit 0
+  }
+  trap cleanup INT TERM
+
+  echo "Starting PostgreSQL..." && \
+  mkdir -p /tmp/postgres-scalapkg && \
+  [ -d /tmp/postgres-scalapkg/data ] || (initdb -D /tmp/postgres-scalapkg/data && \
+  echo "host all all 127.0.0.1/32 trust" >> /tmp/postgres-scalapkg/data/pg_hba.conf && \
+  echo "host all all ::1/128 trust" >> /tmp/postgres-scalapkg/data/pg_hba.conf) && \
+  pg_ctl -D /tmp/postgres-scalapkg/data -l /tmp/postgres-scalapkg.log start -o "-k /tmp/postgres-scalapkg" && \
+  sleep 1 && \
+  (psql -h localhost -d postgres -tc "SELECT 1 FROM pg_roles WHERE rolname='scalapkg'" | grep -q 1 || \
+   psql -h localhost -d postgres -c "CREATE USER scalapkg WITH SUPERUSER;") && \
+  (psql -h localhost -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='scalapkg'" | grep -q 1 || \
+   psql -h localhost -d postgres -c "CREATE DATABASE scalapkg OWNER scalapkg;") && \
+  pg_isready -h localhost && \
+  echo "PostgreSQL started successfully" && \
+  echo "" && \
+  echo "Server: http://localhost:8080" && \
+  echo "Press Ctrl-C to stop all services" && \
+  SCALAPKG_DB_HOST=localhost \
+  SCALAPKG_DB_PORT=5432 \
+  SCALAPKG_DB_USER=scalapkg \
+  SCALAPKG_DB_NAME=scalapkg \
+  SCALAPKG_BASE_URL=http://localhost:8080 \
+  ./mill backend.run
+
+  # Cleanup on normal exit
+  cleanup
+"""
