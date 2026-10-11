@@ -105,6 +105,14 @@ class RoutesSuite extends CatsEffectSuite {
       )
     def get(ref: PackageRef): IO[Option[PackageSummary]] =
       IO.pure(all.find(_.ref == ref))
+    // cats-core dropped Scala 2.12 after 2.10.0
+    def targetVersions(ref: PackageRef): IO[Map[Target, String]] =
+      IO.pure(
+        all.find(_.ref == ref).toList.flatMap(p =>
+          p.parsedTargets.map(_ -> p.latestVersion) ++
+            Target.parseKey("jvm:2.12").filter(_ => p == cats).map(_ -> "2.10.0")
+        ).toMap
+      )
     def newest(limit: Int): IO[List[PackageSummary]] = IO.pure(all.take(limit))
     def mostStarred(limit: Int): IO[List[PackageSummary]] = IO.pure(List(cats))
     def newProjects(limit: Int): IO[List[NewProject]] =
@@ -387,6 +395,8 @@ class RoutesSuite extends CatsEffectSuite {
       pkg <- call("get_package", """{"group_id":"org.typelevel","name":"cats-core"}""")
       missing <- call("get_package", """{"group_id":"x","name":"y"}""")
       snippet <- call("install_snippet", """{"group_id":"org.typelevel","name":"cats-core","build_tool":"scala-cli"}""")
+      for212 <- call("install_snippet", """{"group_id":"org.typelevel","name":"cats-core","build_tool":"sbt","scala_version":"2.12"}""")
+      for211 <- call("install_snippet", """{"group_id":"org.typelevel","name":"cats-core","scala_version":"2.11"}""")
       recent <- call("recent_releases", """{"since":"2025-01-01"}""")
       unknown <- call("nope", "{}")
       failed <- call("search_packages", """{"query":"boom"}""")
@@ -396,6 +406,10 @@ class RoutesSuite extends CatsEffectSuite {
       assert(missing.contains("\"isError\":true"), missing)
       assert(snippet.contains("using dep org.typelevel::cats-core"), snippet)
       assert(!snippet.contains("libraryDependencies"), snippet)
+      // the last release for 2.12, not the latest
+      assert(for212.contains("2.10.0") && !for212.contains("2.13.0"), for212)
+      assert(!for212.contains("Mill"), for212)
+      assert(for211.contains("\"isError\":true") && for211.contains("not published for Scala 2.11"), for211)
       assert(recent.contains("2.13.0"), recent)
       assert(unknown.contains("-32602"), unknown)
       // a failure inside a tool is a tool error, whatever its exception type

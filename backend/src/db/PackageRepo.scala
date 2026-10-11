@@ -38,6 +38,11 @@ trait PackageRepo:
   def search(query: SearchQuery): IO[SearchResponse]
   def get(ref: PackageRef): IO[Option[PackageSummary]]
 
+  /** The newest version of each of the package's targets: older than its latest
+    * version for a target it stopped publishing.
+    */
+  def targetVersions(ref: PackageRef): IO[Map[Target, String]]
+
   /** Recently released projects, newest first, each shown by the main module of
     * its latest release; deprecated packages, and those with no source
     * repository (nothing to describe them with), are left out.
@@ -542,6 +547,15 @@ object PackageRepo:
               .apply((ref.groupId, ref.name)),
           summary
         ).map(_.headOption)
+
+      def targetVersions(ref: PackageRef): IO[Map[Target, String]] =
+        list(
+          sql"""SELECT target, latest_version FROM artifacts
+                WHERE group_id = $text AND name = $text""".apply(
+            (ref.groupId, ref.name)
+          ),
+          text *: text
+        ).map(_.flatMap((t, v) => Target.parseKey(t).map(_ -> v)).toMap)
 
       /** `WITH moved`: the groupIds of projects that republished their modules
         * under a newer one (`org.playframework` after `com.typesafe.play`), so

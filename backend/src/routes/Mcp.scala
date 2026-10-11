@@ -260,19 +260,50 @@ final class Mcp(
     ),
     Tool(
       "install_snippet",
-      "Dependency line(s) to add a Scala package to an sbt, Mill or scala-cli build.",
+      "Dependency line(s) to add a Scala package to an sbt, Mill or scala-cli build. With scala_version, the lines name the newest version published for that Scala version (the latest release may have dropped it), and say so when there is none.",
       schema(
         "group_id" -> str("Maven groupId"),
         "name" -> str("Library name without the Scala suffix"),
-        "build_tool" -> enumOf("Build tool", List("sbt", "mill", "scala-cli"))
+        "build_tool" -> enumOf("Build tool", List("sbt", "mill", "scala-cli")),
+        "scala_version" -> enumOf(
+          "The Scala version of the build the lines are for",
+          ScalaVersions.supported
+        ),
+        "platform" -> enumOf(
+          "With scala_version: only the lines for this platform",
+          List("jvm", "js", "native")
+        )
       )("group_id", "name"),
       args =>
         withPackage(args) { p =>
           val tool = arg(args, "build_tool").map(_.toLowerCase)
-          val snippets = p.install
-            .filter(s => tool.forall(t => s.tool.toLowerCase == t))
-          outcome(EventKind.Copy, p, Some(tool.getOrElse("all")))
-            .as(toolText(snippets.asJson))
+          def forTool(snippets: List[Snippet]) =
+            snippets.filter(s => tool.forall(t => s.tool.toLowerCase == t))
+          val answer = arg(args, "scala_version") match
+            case None        => IO.pure(toolText(forTool(p.install).asJson))
+            case Some(scala) =>
+              repo.targetVersions(p.ref).map { versions =>
+                InstallSnippets.forScala(
+                  p,
+                  versions,
+                  scala,
+                  arg(args, "platform")
+                ) match
+                  case Left(why) => toolText(why.asJson, isError = true)
+                  case Right(m)  =>
+                    toolText(
+                      Json
+                        .obj(
+                          "snippets" -> forTool(m.snippets).asJson,
+                          "versions" -> Json.obj(
+                            m.versions.map((t, v) => t.key -> v.asJson)*
+                          ),
+                          "note" -> m.note.asJson
+                        )
+                        .dropNullValues
+                    )
+              }
+          outcome(EventKind.Copy, p, Some(tool.getOrElse("all"))) *> answer
         }
     )
   )

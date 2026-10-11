@@ -240,6 +240,14 @@ class PackageRepoSuite extends CatsEffectSuite {
     }
   }
 
+  test("each target has its own newest version") {
+    withDb { r =>
+      r.search.targetVersions(PackageRef("com.typesafe.play", "play")).map { vs =>
+        assertEquals(vs.map((t, v) => t.key -> v), Map("jvm:2.13" -> "2.9.12"))
+      }
+    }
+  }
+
   test("new releases leave out packages with no source repository") {
     withDb { r =>
       r.search.newest(50).map { pkgs =>

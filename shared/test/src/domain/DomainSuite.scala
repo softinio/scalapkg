@@ -132,6 +132,71 @@ class DomainSuite extends munit.FunSuite {
     )
   }
 
+  private def lib(targets: String*) =
+    PackageSummary("org.typelevel", "cats-core", "2.13.0", None, targets.toList, Nil, deprecated = false, None)
+
+  private def versions(pairs: (String, String)*): Map[Target, String] =
+    pairs.flatMap((k, v) => Target.parseKey(k).map(_ -> v)).toMap
+
+  test("install lines for a Scala version name the newest version published for it") {
+    val vs = versions(
+      "jvm:3" -> "2.13.0",
+      "jvm:2.11" -> "2.0.0",
+      "sjs0.6:2.11" -> "2.0.0",
+      "sjs1:3" -> "2.13.0",
+      "sjs0.6:3" -> "1.0.0"
+    )
+    val p = lib(vs.keys.map(_.key).toSeq*)
+    val old = InstallSnippets.forScala(p, vs, "2.11", None).toOption.get
+    assertEquals(old.snippets.head.code.linesIterator.toList.map(_.takeRight(9)), List("% \"2.0.0\"", "% \"2.0.0\""))
+    assertEquals(old.note, None)
+    // the newest Scala.js, not Scala.js 0.6
+    val js = InstallSnippets.forScala(p, vs, "3", Some("js")).toOption.get
+    assertEquals(js.versions.map((t, v) => (t.key, v)), List("sjs1:3" -> "2.13.0"))
+    assertEquals(js.snippets.find(_.tool == "Mill").map(_.code), Some("""mvn"org.typelevel::cats-core::2.13.0""""))
+  }
+
+  test("lines for targets on different versions keep each version") {
+    val vs = versions("jvm:2.12" -> "2.13.0", "native0.4:2.12" -> "2.11.0")
+    val m = InstallSnippets.forScala(lib(), vs, "2.12", None).toOption.get
+    assertEquals(
+      m.snippets.find(_.tool == "scala-cli").map(_.code),
+      Some("//> using dep org.typelevel::cats-core:2.13.0\n//> using dep org.typelevel::cats-core::2.11.0")
+    )
+  }
+
+  test("a Scala 3 build gets a 2.13-only library through for3Use2_13") {
+    val m = InstallSnippets.forScala(lib("jvm:2.13"), versions("jvm:2.13" -> "1.0.0"), "3", None).toOption.get
+    assertEquals(
+      m.snippets.map(_.code),
+      List(
+        """libraryDependencies += ("org.typelevel" %% "cats-core" % "1.0.0").cross(CrossVersion.for3Use2_13)""",
+        """mvn"org.typelevel:cats-core_2.13:1.0.0"""",
+        "//> using dep org.typelevel:cats-core_2.13:1.0.0"
+      )
+    )
+    assert(m.note.isDefined)
+  }
+
+  test("no install lines for a Scala version or platform never published") {
+    val vs = versions("jvm:3" -> "2.13.0", "jvm:2.13" -> "2.13.0")
+    assertEquals(
+      InstallSnippets.forScala(lib(), vs, "2.12", None),
+      Left("org.typelevel:cats-core is not published for Scala 2.12; it is for Scala 3, Scala 2.13")
+    )
+    assertEquals(
+      InstallSnippets.forScala(lib(), vs, "3", Some("native")),
+      Left("org.typelevel:cats-core is not published on Scala Native")
+    )
+  }
+
+  test("a build plugin's install line does not depend on the build's Scala version") {
+    val p = lib("sbt1:2.12").copy(name = "sbt-scalafmt")
+    val m = InstallSnippets.forScala(p, versions("sbt1:2.12" -> "2.13.0"), "3", None).toOption.get
+    assertEquals(m.snippets.map(_.tool), List("sbt"))
+    assert(m.note.isDefined)
+  }
+
   test("codecs round-trip a search response") {
     val summary = PackageSummary(
       "org.typelevel",
