@@ -178,6 +178,16 @@ class PackageRepoSuite extends CatsEffectSuite {
     }
   }
 
+  test("a result opens the project's main module among those matching the query") {
+    withDb { r =>
+      search(r, "circe").map { res =>
+        val circe = res.results.find(_.key == "github.com/circe/circe")
+        // both modules match; circe-testing was released last
+        assertEquals(circe.map(_.primary.name), Some("circe-core"), keys(res))
+      }
+    }
+  }
+
   test("a project that moved to a new groupId is shown by its new coordinates") {
     withDb { r =>
       for

@@ -411,8 +411,9 @@ object PackageRepo:
       private val shownModules = 6
 
       /** The modules shown under each result: those whose name matches the
-        * query first, then those not under a groupId the project moved away
-        * from, then the project's main modules.
+        * query first, then the one named like the project, then in
+        * [[mainModuleOrder]]. The first is the one the result's title opens, so
+        * `kyo` opens kyo-core, not whichever `kyo-*` module has most targets.
         */
       private def withModules(
           docs: List[DocRow],
@@ -432,12 +433,9 @@ object PackageRepo:
             movedGroups(Some(keys)) |+| void"SELECT " |+| columns(Void) |+|
               void", p.doc_key, p.n FROM (SELECT p.*, row_number() OVER (" |+|
               void"PARTITION BY p.doc_key ORDER BY " |+| nameMatch |+|
-              void""" DESC, p.deprecated,
-                     (p.doc_key, p.group_id) IN (SELECT doc_key, group_id FROM moved),
-                     p.name = d.title DESC,
-                     cardinality(p.targets) DESC,
-                     p.latest_release_at DESC NULLS LAST,
-                     length(p.name), p.name) AS pos,
+              void" DESC, p.deprecated, p.name = d.title DESC, " |+|
+              mainModuleOrder |+|
+              void""") AS pos,
                    count(*) OVER (PARTITION BY p.doc_key)::int4 AS n
                    FROM packages p JOIN search_docs d ON d.key = p.doc_key
                    WHERE """ |+|
