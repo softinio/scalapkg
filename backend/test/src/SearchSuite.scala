@@ -73,8 +73,12 @@ class SearchSuite extends CatsEffectSuite {
       write = (batch: List[SearchLog.Entry]) =>
         written.update(_ :+ batch.flatMap(_.event.total))
       _ <- SearchLog.queued(write, batch = 2, every = 50.millis).use { log =>
+        // the last, half-full batch is written once `every` passes; wait for
+        // it rather than for a fixed time, which a slow CI runner outlasts
         (1 to 5).toList.traverse_(n => log.record(EventSource.Web, event(n))) *>
-          IO.sleep(300.millis)
+          (IO.sleep(10.millis) *> written.get)
+            .iterateUntil(_.flatten.size == 5)
+            .timeout(10.seconds)
       }
       batches <- written.get
     yield
