@@ -18,8 +18,12 @@ package com.softinio.scalapkg
 
 import cats.data.NonEmptyList
 import cats.effect.IO
+import cats.effect.Ref
+import cats.syntax.all.*
+import com.softinio.scalapkg.db.EventSource
 import com.softinio.scalapkg.db.PackageRepo
 import com.softinio.scalapkg.db.SearchGate
+import com.softinio.scalapkg.db.SearchLog
 import com.softinio.scalapkg.domain.*
 import com.softinio.scalapkg.routes.RateLimit
 import io.circe.Json
@@ -113,8 +117,26 @@ class RoutesSuite extends CatsEffectSuite {
   private val live: ArtifactVersion => IO[LiveInfo] =
     _ => IO.pure(LiveInfo(None, Some(Nil), None))
 
-  private def app(limit: Int = 100): IO[HttpApp[IO]] =
-    RateLimit(limit, 1.minute).map(rl => Main.httpApp(baseUrl, None, repo, live, rl))
+  private def app(limit: Int = 100, log: SearchLog = SearchLog.noop): IO[HttpApp[IO]] =
+    for
+      rl <- RateLimit(limit, 1.minute)
+      el <- RateLimit(limit, 1.minute)
+    yield Main.httpApp(baseUrl, None, repo, live, rl, el, log)
+
+  /** A SearchLog that keeps what it is given, in order. */
+  private def recording: IO[(SearchLog, IO[List[(EventSource, SearchEvent)]])] =
+    Ref[IO].of(Vector.empty[(EventSource, SearchEvent)]).map(ref =>
+      ((source, e) => ref.update(_ :+ (source, e)), ref.get.map(_.toList))
+    )
+
+  private def post(app: HttpApp[IO], uri: Uri, body: String): IO[(Status, String)] =
+    app
+      .run(
+        Request[IO](Method.POST, uri)
+          .withEntity(body)
+          .withContentType(headers.`Content-Type`(MediaType.application.json))
+      )
+      .flatMap(r => r.as[String].map((r.status, _)))
 
   private def get(uri: Uri, limit: Int = 100): IO[(Status, String, Headers)] =
     app(limit).flatMap(_.run(Request[IO](Method.GET, uri))).flatMap(r =>
@@ -387,5 +409,66 @@ class RoutesSuite extends CatsEffectSuite {
     yield
       assertEquals(s1, Status.BadRequest)
       assert(body.contains("-32601"))
+  }
+
+  test("results mark their total and each result's key for search events") {
+    get(uri"/fragments/search?q=cats").map { (_, body, _) =>
+      assert(body.contains("data-total=\"1\""), body)
+      assert(body.contains("data-key=\"github.com/typelevel/cats\""), body)
+    }
+  }
+
+  test("search events are checked, normalised and recorded") {
+    val id = "0f6c2a9e-1b7d-4c55-9e21-3a8f5d0c7b64"
+    val session = "6b1e4f0a-2c3d-4e5f-8a9b-0c1d2e3f4a5b"
+    val search =
+      s"""{"kind":"search","searchId":"$id","session":"$session",
+         |"query":{"q":"  json  ","platforms":["jvm","bogus"],"scalaVersions":[],"sort":"relevance","page":1},
+         |"total":42,"results":["github.com/circe/circe"],"result":null,"position":null,"detail":null}""".stripMargin
+    val copy =
+      s"""{"kind":"copy","searchId":"$id","session":"$session","query":null,"total":null,
+         |"results":[],"result":"github.com/circe/circe","position":3,"detail":"sbt"}""".stripMargin
+    val invalid = List(
+      search.replace("\"search\"", "\"hover\""), // unknown kind
+      search.replace(id, "short"), // not an id
+      copy.replace("\"position\":3", "\"position\":null"), // an outcome needs its rank
+      copy.replace("\"detail\":\"sbt\"", s"\"detail\":\"${"x" * 5000}\""), // too big
+      "not json"
+    )
+    for
+      (log, recorded) <- recording
+      a <- app(log = log)
+      (s1, _) <- post(a, uri"/events", search)
+      (s2, _) <- post(a, uri"/events", copy)
+      rejected <- invalid.traverse(b => post(a, uri"/events", b).map(_._1))
+      events <- recorded
+    yield
+      assertEquals((s1, s2), (Status.NoContent, Status.NoContent))
+      assertEquals(rejected.distinct, List(Status.BadRequest))
+      assertEquals(events.map((source, e) => (source, e.kind)), List(EventSource.Web -> EventKind.Search, EventSource.Web -> EventKind.Copy))
+      // the query is stored the way a search request would read it
+      assertEquals(events.head._2.query.map(q => (q.q, q.platforms)), Some(("json", List("jvm"))))
+  }
+
+  test("MCP searches, package lookups and install snippets are recorded") {
+    def call(a: HttpApp[IO], name: String, args: String) =
+      post(a, uri"/mcp", s"""{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"$name","arguments":$args}}""")
+    val pkg = """"group_id":"org.typelevel","name":"cats-core""""
+    for
+      (log, recorded) <- recording
+      a <- app(log = log)
+      _ <- call(a, "search_packages", """{"query":"cats"}""")
+      _ <- call(a, "get_package", s"{$pkg}")
+      _ <- call(a, "install_snippet", s"""{$pkg,"build_tool":"sbt"}""")
+      _ <- call(a, "recent_releases", "{}")
+      events <- recorded
+    yield
+      assert(events.forall(_._1 == EventSource.Mcp))
+      val List(search, open, copy) = events.map(_._2): @unchecked
+      assertEquals(search.kind, EventKind.Search)
+      assertEquals(search.query.map(_.q), Some("cats"))
+      assertEquals((search.total, search.results), (Some(1), List("github.com/typelevel/cats")))
+      assertEquals((open.kind, open.result), (EventKind.Open, Some("org.typelevel:cats-core")))
+      assertEquals((copy.kind, copy.detail), (EventKind.Copy, Some("sbt")))
   }
 }

@@ -16,15 +16,22 @@
 
 package com.softinio.scalapkg
 
+import com.softinio.scalapkg.db.EventSource
 import com.softinio.scalapkg.db.PackageRepo
 import com.softinio.scalapkg.db.SearchGate
+import com.softinio.scalapkg.db.SearchLog
+import com.softinio.scalapkg.domain.EventKind
+import com.softinio.scalapkg.domain.SearchEvent
 
 import cats.effect.IO
+import cats.syntax.all.*
 import com.softinio.scalapkg.embed.Embedder
 import com.softinio.scalapkg.embed.WordPiece
 import com.softinio.scalapkg.github.GitHub
 import com.softinio.scalapkg.github.Readme
 import munit.CatsEffectSuite
+import org.typelevel.log4cats.Logger
+import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 import java.nio.file.Files
 import java.nio.file.Path
@@ -53,6 +60,35 @@ class SearchSuite extends CatsEffectSuite {
       assert(firstSemantic, "one of two slots taken: semantic allowed")
       assert(!second, "two of two slots taken: keyword only")
       assertEquals(full, Left(SearchGate.Busy))
+  }
+
+  private given Logger[IO] = Slf4jLogger.getLogger[IO]
+
+  private def event(n: Int) =
+    SearchEvent(EventKind.Search, Some(s"search-$n"), Some("session-1"), total = Some(n))
+
+  test("the search log writes queued events in batches") {
+    for
+      written <- cats.effect.Ref[IO].of(List.empty[List[Int]])
+      write = (batch: List[SearchLog.Entry]) =>
+        written.update(_ :+ batch.flatMap(_.event.total))
+      _ <- SearchLog.queued(write, batch = 2, every = 50.millis).use { log =>
+        (1 to 5).toList.traverse_(n => log.record(EventSource.Web, event(n))) *>
+          IO.sleep(300.millis)
+      }
+      batches <- written.get
+    yield
+      assertEquals(batches.flatten, List(1, 2, 3, 4, 5))
+      assert(batches.forall(_.size <= 2), batches)
+  }
+
+  test("recording never waits: a full queue drops new events") {
+    // the writer never finishes, so the queue fills up and stays full
+    SearchLog.queued(_ => IO.never, capacity = 2, batch = 1).use { log =>
+      (1 to 50).toList
+        .traverse_(n => log.record(EventSource.Web, event(n)))
+        .timeout(1.second)
+    }
   }
 
   private val tiny = WordPiece(

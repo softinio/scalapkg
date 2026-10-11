@@ -25,6 +25,7 @@ import com.softinio.scalapkg.db.Database
 import com.softinio.scalapkg.db.IngestRepo
 import com.softinio.scalapkg.db.PackageRepo
 import com.softinio.scalapkg.db.SearchGate
+import com.softinio.scalapkg.db.SearchLog
 import com.softinio.scalapkg.depsdev.DepsDev
 import com.softinio.scalapkg.domain.ApiError
 import com.softinio.scalapkg.domain.ArtifactVersion
@@ -69,23 +70,27 @@ object Main extends IOApp.Simple:
   val version: String =
     Option(getClass.getPackage.getImplementationVersion).getOrElse("dev")
 
-  /** All routes: assets, then `/api` and `/mcp` behind `rateLimit`, then the
-    * HTML pages; anything unmatched gets the 404 page. A search refused by the
-    * [[SearchGate]] or cancelled by the statement timeout answers 503 with
-    * `Retry-After`. Responses are gzipped.
+  /** All routes: assets, then `/api` and `/mcp` behind `rateLimit` and
+    * `/events` behind `eventLimit`, then the HTML pages; anything unmatched
+    * gets the 404 page. A search refused by the [[SearchGate]] or cancelled by
+    * the statement timeout answers 503 with `Retry-After`. Responses are
+    * gzipped.
     */
   def httpApp(
       baseUrl: String,
       devAssetsDir: Option[String],
       repo: PackageRepo,
       live: ArtifactVersion => IO[LiveInfo],
-      rateLimit: RateLimit
+      rateLimit: RateLimit,
+      eventLimit: RateLimit,
+      log: SearchLog
   ): HttpApp[IO] =
     val assets = Assets(devAssetsDir)
     val public = PublicRoutes(repo, baseUrl)
     val limited = Router(
       "/api" -> rateLimit(ApiRoutes(repo).routes),
-      "/mcp" -> rateLimit(Mcp(repo, live, version).routes)
+      "/mcp" -> rateLimit(Mcp(repo, live, version, log).routes),
+      "/events" -> eventLimit(EventRoutes(log).routes)
     )
     val routes = assets.routes <+> limited <+> public.routes
     // the Scala.js bundle and the HTML compress well (~900 KB -> ~200 KB JS)
@@ -178,6 +183,14 @@ object Main extends IOApp.Simple:
             ingest = IngestRepo(sessions)
             _ <- Resource.eval(ingest.rebuildSearchDocs)
             rateLimit <- Resource.eval(RateLimit(60, 1.minute))
+            // a settled search at most every couple of seconds, plus clicks
+            eventLimit <- Resource.eval(RateLimit(60, 1.minute))
+            searchLog <- SearchLog.queued(SearchLog.writer(sessions))
+            _ <- Scheduler
+              .every("search-events", 10.minutes, 24.hours)(
+                SearchLog.prune(sessions, 90.days)
+              )
+              .background
             _ <- optional(
               Option.when(config.ingest.enabled)(
                 jobs(client, depsDev, ingest, config.ingest)
@@ -224,7 +237,9 @@ object Main extends IOApp.Simple:
                   config.devAssetsDir,
                   repo,
                   live,
-                  rateLimit
+                  rateLimit,
+                  eventLimit,
+                  searchLog
                 )
               )
               .build

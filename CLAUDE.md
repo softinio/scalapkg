@@ -123,15 +123,33 @@ compare-and-set (`IngestRepo.advance`), and `saveDetails` inserts project rows
 before any artifact points at them. `IngestRepo` writes refresh the search
 documents they affect themselves; there is no separate reindex step.
 
-**Data model** (`backend/resources/db/migration/V1__init.sql`, the only
-migration while the project is unreleased): `artifacts` (one row per Maven
+**Data model** (`backend/resources/db/migration/`): `artifacts` (one row per Maven
 artifactId) → `packages` (artifacts grouped by group + name across
 platform/Scala suffixes) → `search_docs` (one document per project, or per
 groupId when there is no repository; `packages.doc_key` is the link).
 `IngestRepo.rebuildSearchDocs` rebuilds every search document from packages and
-projects and runs on every server start. Editing `V1__init.sql` changes
-its checksum, so an existing dev database needs `resetDB`, a server start
-(migrates) and `loadSeed`.
+projects and runs on every server start. Production has applied the
+migrations, so never edit one: a schema change is a new `V<n>__name.sql`,
+also listed in `Database.migrate`. Dumbo refuses to start when an applied
+file's checksum changed.
+
+**Search events** (`db/SearchLog.scala`, table `search_events`, migration V2)
+record searches and what was done with their results, to check ranking
+against real use. The search island (`ui/SearchEvents.scala`) records a
+search once its results have stayed on screen for 1.5 s with no typing (so
+search as you type does not record half-typed queries), reading the total and
+result keys from `data-total` / `data-key` in the results HTML. It also
+records a result opened from it with its position, and the links followed and
+snippets copied in that drawer. Events go by `sendBeacon` to `POST /events`
+(`EventRoutes`, which checks them; its own 60/min limit). They are recorded in
+the browser because Cloudflare caches `/fragments/search`, so the server never
+sees most searches. MCP's `search_packages`, `get_package` and
+`install_snippet` are recorded on the server. Recording never waits: a
+bounded queue is written in batches and drops events when full. Nothing
+identifies a visitor (a random id per tab, no address); rows are deleted
+after 90 days, and the About page says so. `scripts/search-report.sql` turns
+them into the queries to add to `SearchEvalSuite`. The seed never includes
+this table.
 
 **Search** (`db/PackageRepo.scala`): a keyword list (Postgres FTS with field
 weights A name, B description/topics/summary/keywords, C module names/groups,
@@ -160,8 +178,8 @@ Calico islands on `data-island` elements. The search island swaps in
 `/fragments/search` HTML and the drawer reads package data from `data-pkg`
 attributes and calls api.deps.dev from the browser. Every page works without JS
 (SSR fallback, `/p/{group}/{name}` deep links). `RateLimit` (60 per client per
-minute) wraps only `/api` and `/mcp` and keys on `X-Real-IP`, which only nginx
-may set; the app must not be reachable except through nginx.
+minute) wraps only `/api`, `/mcp` and `/events` and keys on `X-Real-IP`, which
+only nginx may set; the app must not be reachable except through nginx.
 
 ## Configuration
 

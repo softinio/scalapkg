@@ -39,10 +39,12 @@ object Drawer:
 
   /** Renders the package in `current`, fetching its live details whenever it
     * changes; a fetch still running for the previous package is cancelled.
+    * Links followed and snippets copied are reported to `acted`.
     */
   def apply(
       current: Signal[IO, Option[PackageSummary]],
-      close: IO[Unit]
+      close: IO[Unit],
+      acted: (EventKind, String) => IO[Unit]
   ): Resource[IO, HtmlElement[IO]] =
     for
       live <- current.discrete
@@ -63,7 +65,7 @@ object Drawer:
         cls := "flex h-full flex-col",
         current.map {
           case None    => div(cls := "hidden")
-          case Some(p) => panel(p, live, close)
+          case Some(p) => panel(p, live, close, acted)
         }
       )
     yield el
@@ -72,7 +74,8 @@ object Drawer:
       p: PackageSummary,
       // None while deps.dev is being asked
       live: Signal[IO, Option[LiveInfo]],
-      close: IO[Unit]
+      close: IO[Unit],
+      acted: (EventKind, String) => IO[Unit]
   ): Resource[IO, HtmlElement[IO]] =
     val rep = p.representative
     div(
@@ -132,8 +135,8 @@ object Drawer:
             .map(t => span(cls := Styles.topicChip, t))
         ),
         p.project.map(stats),
-        linksRow(p, rep),
-        install(p),
+        linksRow(p, rep, acted),
+        install(p, acted),
         live.map(_.fold(loading)(liveSections(p, _))),
         p_(
           cls := "border-t border-slate-200 pt-4 text-xs text-slate-500 dark:border-slate-800",
@@ -171,25 +174,30 @@ object Drawer:
 
   private def linksRow(
       p: PackageSummary,
-      rep: Option[ArtifactVersion]
+      rep: Option[ArtifactVersion],
+      acted: (EventKind, String) => IO[Unit]
   ): Resource[IO, HtmlElement[IO]] =
-    def ext(url: String, label: String) =
+    def ext(url: String, label: String, kind: String) =
       a(
         href := url,
         target := "_blank",
         rel := List("noopener"),
         cls := Styles.secondaryButton,
+        onClick --> (_.foreach(_ => acted(EventKind.Link, kind))),
         label
       )
     div(
       cls := "flex flex-wrap gap-2",
-      p.project.map(pr => ext(pr.url, "Source ↗")),
-      p.project.flatMap(_.homepage).map(h => ext(h, "Homepage ↗")),
-      rep.map(a => ext(a.depsDevUrl, "deps.dev ↗")),
-      rep.map(a => ext(a.mavenCentralUrl, "Maven Central ↗"))
+      p.project.map(pr => ext(pr.url, "Source ↗", "source")),
+      p.project.flatMap(_.homepage).map(h => ext(h, "Homepage ↗", "homepage")),
+      rep.map(a => ext(a.depsDevUrl, "deps.dev ↗", "deps.dev")),
+      rep.map(a => ext(a.mavenCentralUrl, "Maven Central ↗", "maven"))
     )
 
-  private def install(p: PackageSummary): Resource[IO, HtmlElement[IO]] =
+  private def install(
+      p: PackageSummary,
+      acted: (EventKind, String) => IO[Unit]
+  ): Resource[IO, HtmlElement[IO]] =
     div(
       h3(cls := Styles.eyebrow, "Install"),
       div(
@@ -202,7 +210,7 @@ object Drawer:
                 cls := "text-sm font-semibold text-slate-700 dark:text-slate-300",
                 s.tool
               ),
-              copyButton(s.code)
+              copyButton(s.code, acted(EventKind.Copy, s.tool))
             ),
             pre(cls := Styles.code, s.code)
           )
@@ -210,14 +218,19 @@ object Drawer:
       )
     )
 
-  private def copyButton(text: String): Resource[IO, HtmlElement[IO]] =
+  private def copyButton(
+      text: String,
+      copiedIt: IO[Unit]
+  ): Resource[IO, HtmlElement[IO]] =
     SignallingRef[IO].of(false).toResource.flatMap { copied =>
       button(
         `type` := "button",
         cls := "rounded-md px-2 py-0.5 text-xs font-medium text-brand hover:bg-brand/10 dark:text-brand-light",
         onClick --> (_.foreach(_ =>
-          IO.fromPromise(IO(dom.window.navigator.clipboard.writeText(text)))
-            .attempt *>
+          // recorded on the click: the clipboard promise may never settle
+          copiedIt *>
+            IO.fromPromise(IO(dom.window.navigator.clipboard.writeText(text)))
+              .attempt *>
             copied.set(true) *> IO
               .sleep(scala.concurrent.duration.DurationInt(1500).millis) *>
             copied.set(false)

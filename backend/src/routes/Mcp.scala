@@ -18,7 +18,9 @@ package com.softinio.scalapkg.routes
 
 import cats.effect.IO
 import cats.syntax.all.*
+import com.softinio.scalapkg.db.EventSource
 import com.softinio.scalapkg.db.PackageRepo
+import com.softinio.scalapkg.db.SearchLog
 import com.softinio.scalapkg.domain.*
 import io.circe.Json
 import io.circe.syntax.*
@@ -31,13 +33,32 @@ import java.time.ZoneOffset
 
 /** A stateless Model Context Protocol server over Streamable HTTP: JSON-RPC 2.0
   * requests POSTed to /mcp, answered with plain JSON. It only offers tools, so
-  * no sessions or server-sent events are needed.
+  * no sessions or server-sent events are needed. Searches, package lookups and
+  * install snippets go to `log`, as the website's do.
   */
 final class Mcp(
     repo: PackageRepo,
     live: ArtifactVersion => IO[LiveInfo],
-    version: String
+    version: String,
+    log: SearchLog
 ):
+
+  // MCP calls are stateless, so a lookup cannot be tied to the search before it
+  private def outcome(
+      kind: EventKind,
+      p: PackageSummary,
+      detail: Option[String]
+  ) =
+    log.record(
+      EventSource.Mcp,
+      SearchEvent(
+        kind,
+        None,
+        None,
+        result = Some(s"${p.groupId}:${p.name}"),
+        detail = detail
+      )
+    )
 
   private val latestVersion = "2025-06-18"
   private val supportedVersions =
@@ -163,6 +184,21 @@ final class Mcp(
         )
         repo
           .search(q)
+          .flatTap(r =>
+            IO.randomUUID.flatMap(id =>
+              log.record(
+                EventSource.Mcp,
+                SearchEvent(
+                  EventKind.Search,
+                  Some(id.toString),
+                  None,
+                  query = Some(q),
+                  total = Some(r.total),
+                  results = r.results.take(SearchEvent.maxResults).map(_.key)
+                )
+              )
+            )
+          )
           .map(r =>
             toolText(
               Json.obj(
@@ -181,6 +217,7 @@ final class Mcp(
       )("group_id", "name"),
       args =>
         withPackage(args) { p =>
+          val opened = outcome(EventKind.Open, p, None)
           val liveInfo = p.representative.traverse(a =>
             live(a).map(info =>
               Json
@@ -188,7 +225,7 @@ final class Mcp(
                 .deepMerge(info.asJson.dropNullValues)
             )
           )
-          liveInfo.map(l =>
+          opened *> liveInfo.map(l =>
             toolText(
               PackageResponse
                 .of(p)
@@ -234,7 +271,8 @@ final class Mcp(
           val tool = arg(args, "build_tool").map(_.toLowerCase)
           val snippets = p.install
             .filter(s => tool.forall(t => s.tool.toLowerCase == t))
-          IO.pure(toolText(snippets.asJson))
+          outcome(EventKind.Copy, p, Some(tool.getOrElse("all")))
+            .as(toolText(snippets.asJson))
         }
     )
   )

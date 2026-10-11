@@ -45,7 +45,8 @@ object Main:
       current <- SignallingRef[IO].of(Option.empty[PackageSummary]).toResource
       // the search query string currently shown in #results
       shown <- Ref[IO].of(dom.window.location.search).toResource
-      nav = Navigation(current, shown)
+      events <- SearchEvents()
+      nav = Navigation(current, shown, events)
       _ <- themeToggle
       _ <- slashShortcut
       _ <- nav.interceptPackageLinks
@@ -55,6 +56,8 @@ object Main:
         (0 until nodes.length).toList.map(nodes(_))
       })
       _ <- islands.traverse_(mount(_, nav))
+      // a search page rendered by the server counts like a swapped-in one
+      _ <- events.resultsShown.toResource
     yield ()
 
   private def mount(el: dom.Element, nav: Navigation): Resource[IO, Unit] =
@@ -97,7 +100,8 @@ object Main:
 /** Keeps the URL, the results region and the drawer in step. */
 final class Navigation(
     current: SignallingRef[IO, Option[PackageSummary]],
-    shown: Ref[IO, String]
+    shown: Ref[IO, String],
+    val events: SearchEvents
 ):
 
   private def path: String = dom.window.location.pathname
@@ -156,25 +160,29 @@ final class Navigation(
               if push then dom.window.history.pushState(null, "", url)
               else dom.window.history.replaceState(null, "", url)
               countPageView(url)
-            } *> shown.set(search)
+            } *> shown.set(search) *> events.resultsShown
           }
           .handleErrorWith(_ => IO(dom.window.location.assign(s"/$search")))
 
   /** Package links carry their summary as JSON in data-pkg; open the drawer
-    * instead of loading /p/... (ctrl/cmd-click still opens a new tab).
+    * instead of loading /p/... (ctrl/cmd-click still opens a new tab). Every
+    * click on one, new tab or not, goes to `events`.
     */
   def interceptPackageLinks: Resource[IO, Unit] =
-    Dom.intercept[dom.MouseEvent](dom.document, "click") { me =>
-      if me.button != 0 || me.metaKey || me.ctrlKey || me.shiftKey || me.altKey
-      then None
-      else
-        Dom
-          .closest(me, "a[data-pkg]")
-          .flatMap(a =>
-            decode[PackageSummary](a.getAttribute("data-pkg")).toOption
-          )
-          .map(open)
-    }
+    Dom.listen(dom.document, "click") { e =>
+      Dom.closest(e, "a[data-pkg]").traverse_(events.linkClicked)
+    } *>
+      Dom.intercept[dom.MouseEvent](dom.document, "click") { me =>
+        if me.button != 0 || me.metaKey || me.ctrlKey || me.shiftKey || me.altKey
+        then None
+        else
+          Dom
+            .closest(me, "a[data-pkg]")
+            .flatMap(a =>
+              decode[PackageSummary](a.getAttribute("data-pkg")).toOption
+            )
+            .map(open)
+      }
 
   /** Mounts the drawer into the server-rendered <dialog>. A /p/... page passes
     * the package in data-props so the drawer opens straight away.
@@ -188,7 +196,7 @@ final class Navigation(
     val closeDialog = IO(if dialog.open then dialog.close())
     for
       _ <- Resource.eval(IO { el.innerHTML = "" })
-      _ <- Drawer(current, closeDialog).renderInto(
+      _ <- Drawer(current, closeDialog, events.drawerAction).renderInto(
         el.asInstanceOf[fs2.dom.Node[IO]]
       )
       _ <- Dom.listen(dialog, "close")(_ =>
@@ -234,7 +242,9 @@ object SearchIsland:
 
     for
       typed <- SignallingRef[IO].of(input.value).toResource
-      _ <- Dom.listen(input, "input")(_ => typed.set(input.value))
+      _ <- Dom.listen(input, "input")(_ =>
+        typed.set(input.value) *> nav.events.typed
+      )
       _ <- Dom.intercept(form, "submit")(_ =>
         Some(nav.swap(searchFor(input.value), push = true))
       )

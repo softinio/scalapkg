@@ -257,6 +257,60 @@ final case class NewProject(
     firstReleaseAt: String
 ) derives Codec.AsObject
 
+/** What a search event records: a search, or what was done with one of its
+  * results.
+  */
+enum EventKind derives CanEqual:
+  /** A query whose results stayed on screen for a moment. */
+  case Search
+
+  /** A result opened in the drawer. */
+  case Open
+
+  /** A link followed from the drawer (source, homepage, deps.dev, Maven). */
+  case Link
+
+  /** An install snippet copied. */
+  case Copy
+
+  def param: String = toString.toLowerCase
+
+object EventKind:
+  given Codec[EventKind] = Codec.from(
+    Decoder.decodeString.emap(s =>
+      values.find(_.param == s).toRight(s"unknown event kind: $s")
+    ),
+    Encoder.encodeString.contramap(_.param)
+  )
+
+/** A search or what was done with its results, which the islands send to
+  * `POST /events` so ranking can be checked against real use. The ids are
+  * random: `searchId` ties outcomes to their search, `session` the searches of
+  * one browser tab. Outcomes carry the result's `key` (`SearchHit.key`) and its
+  * 1-based `position` across pages.
+  *
+  * @param results
+  *   the first result keys shown, in order (searches only)
+  * @param detail
+  *   what was opened, followed or copied, e.g. `org.typelevel:cats-core`,
+  *   `source` or `sbt`
+  */
+final case class SearchEvent(
+    kind: EventKind,
+    searchId: Option[String],
+    session: Option[String],
+    query: Option[SearchQuery] = None,
+    total: Option[Int] = None,
+    results: List[String] = Nil,
+    result: Option[String] = None,
+    position: Option[Int] = None,
+    detail: Option[String] = None
+) derives Codec.AsObject
+
+object SearchEvent:
+  /** Result keys a search event keeps. */
+  val maxResults = 10
+
 /** The body of every JSON API and rate-limit error response. */
 final case class ApiError(error: String) derives Codec.AsObject
 

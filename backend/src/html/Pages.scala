@@ -276,11 +276,15 @@ object Pages:
       label.getOrElse(p.name)
     )
 
-  /** The swappable search results region: facets, sort, list, pager. */
+  /** The swappable search results region: facets, sort, list, pager.
+    * `data-total` and each card's `data-key` are what the search island records
+    * about a search (see `SearchEvent`).
+    */
   def resultsFrag(r: SearchResponse): Frag =
     val q = r.query
     div(
       cls := "grid gap-8 lg:grid-cols-[14rem_1fr]",
+      attr("data-total") := r.total,
       aside(
         cls := "space-y-6",
         facetGroup(
@@ -419,6 +423,7 @@ object Pages:
       hit.packages.size > 1 || primary.name != hit.title
     li(
       cls := Styles.card,
+      attr("data-key") := hit.key,
       div(
         cls := "flex items-start justify-between gap-4",
         div(
@@ -576,7 +581,7 @@ object Pages:
             "About"
           ),
           p_(
-            cls := "mt-4 text-slate-700 dark:text-slate-300",
+            cls := Styles.bodyText,
             "Scala Packages lists every Scala library published to Maven Central. An artifact counts as Scala when its name ends in a Scala version suffix such as ",
             code("_3"),
             ", ",
@@ -589,7 +594,7 @@ object Pages:
         section(
           h2(cls := Styles.sectionHeading, "Where the data comes from"),
           ul(
-            cls := "mt-4 list-disc space-y-2 pl-6 text-slate-700 dark:text-slate-300",
+            cls := s"${Styles.bodyText} list-disc space-y-2 pl-6",
             li(
               "The ",
               strong("Maven Central nexus index"),
@@ -615,7 +620,7 @@ object Pages:
           id := "api",
           h2(cls := Styles.sectionHeading, "JSON API"),
           p_(
-            cls := "mt-4 text-slate-700 dark:text-slate-300",
+            cls := Styles.bodyText,
             "Read-only, no key needed, CORS enabled. Please keep it under 60 requests a minute."
           ),
           endpoint(
@@ -640,7 +645,7 @@ object Pages:
           id := "mcp",
           h2(cls := Styles.sectionHeading, "MCP server"),
           p_(
-            cls := "mt-4 text-slate-700 dark:text-slate-300",
+            cls := Styles.bodyText,
             "AI assistants can search the index through the Model Context Protocol at ",
             code(s"$baseUrl/mcp"),
             " (Streamable HTTP). Tools: search_packages, get_package, recent_releases and install_snippet."
@@ -648,6 +653,14 @@ object Pages:
           tag("pre")(
             cls := s"mt-4 ${Styles.code}",
             s"claude mcp add --transport http scalapkg $baseUrl/mcp"
+          )
+        ),
+        section(
+          id := "privacy",
+          h2(cls := Styles.sectionHeading, "What we record"),
+          p_(
+            cls := Styles.bodyText,
+            "To improve search results, the site records the searches made on it and through the MCP server, and which results were opened, followed or had an install snippet copied, with their position in the list. Nothing identifies you: no IP address, cookie or browser details are kept, only a random id per browser tab so that rephrased searches can be told apart. Records are deleted after 90 days. Page views are counted with GoatCounter, which does not track visitors either."
           )
         )
       )

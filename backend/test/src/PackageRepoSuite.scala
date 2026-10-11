@@ -20,10 +20,12 @@ import cats.effect.IO
 import cats.effect.Resource
 import cats.syntax.all.*
 import com.softinio.scalapkg.db.Database
+import com.softinio.scalapkg.db.EventSource
 import com.softinio.scalapkg.db.IngestRepo
 import com.softinio.scalapkg.db.NewerVersion
 import com.softinio.scalapkg.db.PackageRepo
 import com.softinio.scalapkg.db.PendingArtifact
+import com.softinio.scalapkg.db.SearchLog
 import com.softinio.scalapkg.db.SeenArtifact
 import com.softinio.scalapkg.depsdev.DepsDev
 import com.softinio.scalapkg.depsdev.VersionInfo
@@ -278,6 +280,40 @@ class PackageRepoSuite extends CatsEffectSuite {
             assertEquals(e.code, "57014")
           case other => fail(s"expected a cancelled statement, got $other")
         }
+    }
+  }
+
+  test("search events are stored with their filters and pruned after 90 days") {
+    withDb { db =>
+      val query = SearchQuery("json", List("jvm"), List("3"), Sort.Stars, 2)
+      val now = OffsetDateTime.now()
+      val events = List(
+        SearchLog.Entry(now.minusDays(100), EventSource.Web, SearchEvent(EventKind.Search, Some("search-old"), Some("s"), query = Some(query), total = Some(7), results = List("a", "b"))),
+        SearchLog.Entry(now, EventSource.Mcp, SearchEvent(EventKind.Copy, None, None, result = Some("org.typelevel:cats-core"), detail = Some("sbt")))
+      )
+      for
+        _ <- db.sessions.use(_.execute(sql"TRUNCATE search_events".command))
+        _ <- SearchLog.writer(db.sessions)(events)
+        stored <- db.sessions.use(
+          _.execute(
+            sql"""SELECT source, kind, query, array_to_string(filters, ' '),
+                         array_to_string(results, ' '), detail
+                  FROM search_events ORDER BY kind DESC"""
+              .query(text *: text *: text.opt *: text *: text *: text.opt)
+          )
+        )
+        pruned <- SearchLog.prune(db.sessions, 90.days)
+        left <- db.sessions.use(_.unique(sql"SELECT count(*) FROM search_events".query(int8)))
+      yield
+        assertEquals(
+          stored,
+          List(
+            ("web", "search", Some("json"), "platform=jvm scala=3 sort=stars page=2", "a b", None),
+            ("mcp", "copy", None, "", "", Some("sbt"))
+          )
+        )
+        assertEquals(pruned, "deleted 1 old search events")
+        assertEquals(left, 1L)
     }
   }
 

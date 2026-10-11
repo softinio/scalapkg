@@ -63,14 +63,18 @@ object Database:
 
   // NOTE: every new migration file must also be added to this list
   /** Applies pending migrations with Dumbo; fails if an applied migration's
-    * checksum changed (an edited `V1__init.sql` needs `resetDB`).
+    * checksum changed, so applied files are never edited: a schema change is a
+    * new file.
     */
   def migrate(sessions: Resource[IO, Session[IO]])(using
       Logger[IO]
   ): IO[Unit] =
     Dumbo
       .withResources[IO](
-        List(dumbo.ResourceFilePath("/db/migration/V1__init.sql"))
+        List(
+          dumbo.ResourceFilePath("/db/migration/V1__init.sql"),
+          dumbo.ResourceFilePath("/db/migration/V2__search_events.sql")
+        )
       )
       .withSession(sessions)(using cats.effect.Sync[IO], dumboConsoleLogger)
       .runMigration

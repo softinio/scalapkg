@@ -21,10 +21,13 @@ import cats.data.OptionT
 import cats.effect.IO
 import cats.effect.Ref
 import cats.syntax.all.*
+import com.softinio.scalapkg.db.EventSource
 import com.softinio.scalapkg.db.PackageRepo
+import com.softinio.scalapkg.db.SearchLog
 import com.softinio.scalapkg.domain.*
 import com.softinio.scalapkg.html.Feed
 import com.softinio.scalapkg.html.Pages
+import io.circe.parser.decode
 import io.circe.syntax.*
 import org.http4s.*
 import org.http4s.circe.CirceEntityEncoder.*
@@ -33,6 +36,7 @@ import org.http4s.headers.`Retry-After`
 import org.typelevel.ci.CIString
 import org.typelevel.log4cats.slf4j.Slf4jFactory
 
+import java.nio.charset.StandardCharsets.UTF_8
 import java.time.Instant
 import java.time.LocalDate
 import java.time.OffsetDateTime
@@ -207,6 +211,57 @@ object ApiRoutes:
       .orElse(Try(Instant.parse(s).atOffset(ZoneOffset.UTC)))
       .orElse(Try(LocalDate.parse(s).atStartOfDay().atOffset(ZoneOffset.UTC)))
       .toOption
+
+/** `POST /events`: search events from the islands (see [[SearchEvent]]). The
+  * body is read only up to `EventRoutes.maxBody` bytes and checked before it is
+  * queued; a malformed event gets 400, an accepted one 204 (whether or not the
+  * queue had room for it).
+  */
+final class EventRoutes(log: SearchLog):
+
+  val routes: HttpRoutes[IO] = HttpRoutes.of[IO] { case req @ POST -> Root =>
+    req.body
+      .take(EventRoutes.maxBody + 1L)
+      .compile
+      .to(Array)
+      .flatMap { bytes =>
+        Option
+          .when(bytes.length <= EventRoutes.maxBody)(bytes)
+          .flatMap(b => decode[SearchEvent](String(b, UTF_8)).toOption)
+          .flatMap(EventRoutes.validated)
+          .fold(BadRequest())(e =>
+            log.record(EventSource.Web, e) *> NoContent()
+          )
+      }
+  }
+
+object EventRoutes:
+  val maxBody = 4096
+  private val maxText = 200
+  private val id = "[A-Za-z0-9-]{8,64}".r
+
+  /** The event if it is well formed, its query normalised the way a search
+    * request's would be.
+    */
+  def validated(e: SearchEvent): Option[SearchEvent] =
+    val query =
+      e.query.map(q => SearchQuery.fromParams(q.params.groupMap(_._1)(_._2)))
+    val shape = e.kind match
+      case EventKind.Search =>
+        query.isDefined && e.total.exists(_ >= 0) &&
+        e.result.isEmpty && e.position.isEmpty
+      case _ =>
+        e.query.isEmpty && e.total.isEmpty && e.results.isEmpty &&
+        e.result.isDefined &&
+        e.position.exists(p =>
+          p >= 1 && p <= SearchQuery.maxPage * SearchQuery.pageSize
+        )
+    Option.when(
+      shape &&
+        e.searchId.exists(id.matches) && e.session.exists(id.matches) &&
+        e.results.size <= SearchEvent.maxResults &&
+        (e.results ++ e.result ++ e.detail).forall(_.length <= maxText)
+    )(e.copy(query = query))
 
 /** Fixed-window per-client request limit for the API and MCP endpoints. The
   * client is the X-Real-IP address (nginx overwrites it) or the peer, never

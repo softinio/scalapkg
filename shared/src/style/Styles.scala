@@ -44,6 +44,8 @@ object Styles:
   val sectionHeading =
     "font-display text-2xl font-bold tracking-tight text-slate-900 dark:text-white"
 
+  val bodyText = "mt-4 text-slate-700 dark:text-slate-300"
+
   val eyebrow =
     "font-mono text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400"
 
