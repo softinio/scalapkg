@@ -194,7 +194,9 @@ name). A project that republished its modules under a new groupId
 (`movedGroups`), on the home page and in search results. New projects are those whose earliest artifact
 release is within `newProjectDays` and whose GitHub repo is not much older than
 that release, so projects that only moved Maven coordinates are left out. Most
-starred only lists projects publishing for 2.13 or 3 (or plugins).
+starred only lists projects publishing for 2.13 or 3 (or plugins), and new
+releases only those with a source repository (the feed and releases API keep
+them all).
 
 **Renamed repositories**: artifacts released before a GitHub rename or
 transfer still name the old repository. The GitHub job records the new one in

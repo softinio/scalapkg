@@ -230,6 +230,17 @@ class PackageRepoSuite extends CatsEffectSuite {
     }
   }
 
+  test("new releases leave out packages with no source repository") {
+    withDb { r =>
+      r.search.newest(50).map { pkgs =>
+        // solo-lib is the newest release in the fixture, but deps.dev links
+        // it to no repository, so there is nothing to describe it with
+        assert(!pkgs.exists(_.name == "solo-lib"), pkgs.map(_.name))
+        assert(pkgs.exists(_.groupId == "io.circe"), pkgs.map(_.name))
+      }
+    }
+  }
+
   test("most starred shows each current project's main module") {
     withDb { r =>
       r.search.mostStarred(10).map { pkgs =>

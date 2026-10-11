@@ -39,7 +39,8 @@ trait PackageRepo:
   def get(ref: PackageRef): IO[Option[PackageSummary]]
 
   /** Recently released projects, newest first, each shown by the main module of
-    * its latest release; deprecated packages are left out.
+    * its latest release; deprecated packages, and those with no source
+    * repository (nothing to describe them with), are left out.
     */
   def newest(limit: Int): IO[List[PackageSummary]]
 
@@ -591,7 +592,8 @@ object PackageRepo:
                    FROM (SELECT p.*, p.latest_release_at >= max(p.latest_release_at)
                                   OVER (PARTITION BY p.doc_key) - interval '1 day' AS in_latest
                          FROM packages p
-                         WHERE p.latest_release_at IS NOT NULL AND NOT p.deprecated) p) p
+                         WHERE p.latest_release_at IS NOT NULL AND NOT p.deprecated
+                           AND p.project_id IS NOT NULL) p) p
                  LEFT JOIN projects pr ON pr.id = p.project_id
                  WHERE p.rn = 1""" |+|
             sql" ORDER BY p.latest_release_at DESC LIMIT $int4".apply(limit),
