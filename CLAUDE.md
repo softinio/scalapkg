@@ -153,24 +153,55 @@ this table.
 
 **Search** (`db/PackageRepo.scala`): a keyword list (Postgres FTS with field
 weights A name, B description/topics/summary/keywords, C module names/groups,
-D README; prefix and stemmed matching, plus trigram title similarity for typos)
+D README; whole and stemmed words, prefixes at a lower weight, plus trigram
+title similarity for typos)
 fused by reciprocal rank with a semantic list (pgvector, within
 `SCALAPKG_SEMANTIC_MAX_DISTANCE`; for one-word queries only when nothing matches
 by keyword), then multiplied by popularity (stars, dependents), a Scala-version
 factor (2.13 and 3 best; 2.13-only, 3-only and older lower; sbt/Mill plugins
-exempt) and penalties for deprecated and typo-only matches. A hit is "strong"
+exempt) and penalties for deprecated and typo-only matches. An established
+project (`Ranking.exactNameStars` / `exactNameDependents`) whose name is the
+query comes first, so `zio` finds zio/zio among hundreds of zio-* projects
+while a tiny repo called `json` gains nothing. A hit is "strong"
 when it matches the project's own text (weights A/B, a close title typo, or the
 owner name); the Stars and Recent sorts keep only strong hits, and Best match
-sets `related` when none are strong. `PackageRepo.Ranking` holds the tuned
-constants. Change them only with the eval or grid run, and update the baseline
-comment in `SearchEvalSuite`.
+sets `related` when none are strong. `PackageRepo.Ranking` holds the
+constants, tuned on the full index (below). Change them only with the eval or
+grid run on it, and update the baseline comment in `SearchEvalSuite`.
+
+The seed is small, so a ranking that scores well on it can still fail on the
+full index. To tune on real data, restore a production dump into its own
+database and point the eval at it (leave `search_events` behind; it stays on
+the server):
+
+```bash
+# on the server
+pg_dump -Fc --exclude-table-data=search_events scalapkg > scalapkg.dump
+# locally
+createdb -h localhost -U scalapkg scalapkg_full
+pg_restore -h localhost -U scalapkg -d scalapkg_full --no-owner scalapkg.dump
+SCALAPKG_EVAL_DB_NAME=scalapkg_full SCALAPKG_EVAL_DB_PORT=5432 ./mill backend.test.testOnly com.softinio.scalapkg.SearchEvalSuite
+```
+
+The floors are set for the seed, so the eval may fail on the full index; the
+per-query lines are what to read there.
 
 **Home page lists** (`newest`, `mostStarred`, `newProjects` in `PackageRepo`)
-show one main module per project (most dependents, not test/bench/internal,
-most targets, shortest name). New projects are those whose earliest artifact
+show one main module per project (not under a groupId the project moved away
+from, then most dependents, not test/bench/internal, most targets, shortest
+name). A project that republished its modules under a new groupId
+(`com.typesafe.play` → `org.playframework`) is shown by the new one
+(`movedGroups`), on the home page and in search results. New projects are those whose earliest artifact
 release is within `newProjectDays` and whose GitHub repo is not much older than
 that release, so projects that only moved Maven coordinates are left out. Most
 starred only lists projects publishing for 2.13 or 3 (or plugins).
+
+**Renamed repositories**: artifacts released before a GitHub rename or
+transfer still name the old repository. The GitHub job records the new one in
+`projects.moved_to` (migration V3), and packages join that project, or when
+it is not indexed the first of the old names that moved to it
+(`IngestRepo.currentProject`), so tpolecat/skunk and typelevel/skunk are one
+result. About one GitHub project in eleven has moved. Without a GitHub token nothing is merged.
 
 **Web**: scalatags server rendering (`html/Pages.scala`, `Layout.scala`), JSON
 API `/api/v1/*` and MCP JSON-RPC at `/mcp` (`routes/`). The frontend mounts

@@ -350,6 +350,17 @@ final class IngestRepo(sessions: Resource[IO, Session[IO]]):
         .to[ArtifactRow]
     )
 
+  // a package's project, or the project its repository moved to: the
+  // artifacts released before a rename or transfer still name the old
+  // repository, and would make it a second result. When the new repository
+  // is not indexed itself, the old names that moved to it share the first
+  // of them (typesafehub/scala-logging and lightbend/scala-logging)
+  private val currentProject =
+    """coalesce((SELECT coalesce(t.id, (SELECT min(s.id) FROM projects s
+                                         WHERE s.moved_to = o.moved_to))
+                 FROM projects o LEFT JOIN projects t ON t.id = o.moved_to
+                 WHERE o.id = p.project_id), p.project_id)"""
+
   // the search vector depends only on the name, so it is written once
   /** Writes these packages and refreshes the search documents they belong to.
     */
@@ -362,7 +373,10 @@ final class IngestRepo(sessions: Resource[IO, Session[IO]]):
                     (group_id, name, project_id, latest_version,
                      latest_release_at, targets, platforms, scala_versions,
                      licenses, deprecated, search)
-                  SELECT p.*, #$searchExpr
+                  SELECT p.group_id, p.name, #$currentProject,
+                         p.latest_version, p.latest_release_at, p.targets,
+                         p.platforms, p.scala_versions, p.licenses,
+                         p.deprecated, #$searchExpr
                   FROM (VALUES ($text, $text, ${text.opt}, $text,
                                 ${timestamptz.opt}, $textList, $textList,
                                 $textList, $textList, $bool))
@@ -409,17 +423,33 @@ final class IngestRepo(sessions: Resource[IO, Session[IO]]):
       )(limit)
     )
 
+  /** Saves what GitHub said, and moves the packages of renamed repositories to
+    * the new project (see `currentProject`).
+    */
   def saveGithub(repos: List[RepoText]): IO[Unit] =
     repos.traverse_ { r =>
       run(
         sql"""UPDATE projects
               SET topics = $textList, readme = ${text.opt},
                   repo_created_at = coalesce(${timestamptz.opt}, repo_created_at),
+                  moved_to = ${text.opt},
                   github_refreshed_at = now()
               WHERE id = $text""".command,
-        (r.topics, r.readme, r.createdAt, r.projectId)
+        (r.topics, r.readme, r.createdAt, r.movedTo, r.projectId)
       )
-    } *> refreshDocs(repos.map(_.projectId))
+    } *> {
+      val ids = repos.map(_.projectId)
+      sessions
+        .use(
+          _.execute(
+            sql"""UPDATE packages p SET project_id = #$currentProject
+                  WHERE p.project_id = ANY($textList)
+                    AND p.project_id IS DISTINCT FROM #$currentProject
+                  RETURNING p.project_id""".query(text)
+          )(ids)
+        )
+        .flatMap(moved => refreshDocs(ids ++ moved))
+    }
 
   /** Projects with no summary yet, or whose text changed since (at most once a
     * month), and not waiting in a batch. With `afterGithub`, GitHub projects

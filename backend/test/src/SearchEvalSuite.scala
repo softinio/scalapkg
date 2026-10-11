@@ -46,7 +46,9 @@ import scala.concurrent.duration.*
   */
 class SearchEvalSuite extends CatsEffectSuite {
 
-  override val munitIOTimeout = 5.minutes
+  // a grid run over the full index takes longer
+  override val munitIOTimeout =
+    if sys.env.contains("SCALAPKG_EVAL_GRID") then 2.hours else 5.minutes
 
   private val port = sys.env.get("SCALAPKG_EVAL_DB_PORT").flatMap(_.toIntOption)
 
@@ -60,21 +62,24 @@ class SearchEvalSuite extends CatsEffectSuite {
     "csv" -> List("nrinaudo/kantan.csv", "christopherdavenport/cormorant", "sovt/spata", "gekomad/itto-csv", "zamblauskas/scala-csv-parser"),
     "http client" -> List("softwaremill/sttp", "com-lihaoyi/requests-scala", "http4s/http4s", "timt/naive-http", "spinoco/fs2-http"),
     "http server" -> List("http4s/http4s", "akka/akka-http", "zio/zio-http", "apache/pekko-http", "finagle/finch"),
-    "logging" -> List("typesafehub/scala-logging", "outr/scribe", "typelevel/log4cats", "zio/zio-logging", "lego/woof"),
+    "logging" -> List("lightbend/scala-logging", "outr/scribe", "typelevel/log4cats", "zio/zio-logging", "log4s/log4s", "lego/woof"),
     "command line arguments" -> List("scopt/scopt", "com-lihaoyi/mainargs", "alexarchambault/case-app", "bkirwi/decline", "jfkelley/argyle"),
     "parse markdown" -> List("noelwelsh/mads", "onewebpro/scala-md-tag", "lightbend/paradox", "scalameta/mdoc"),
     "parser combinators" -> List("scala/scala-parser-combinators", "com-lihaoyi/fastparse", "j-mie6/parsley", "tpolecat/atto", "djspiewak/gll-combinators"),
     "property based testing" -> List("typelevel/scalacheck", "hedgehogqa/scala-hedgehog", "propensive/probably"),
-    "testing" -> List("scalatest/scalatest", "scalameta/munit", "typelevel/cats-effect-testing"),
-    "database access" -> List("tpolecat/doobie", "slick/slick", "typelevel/skunk", "augustnagro/magnum", "playframework/anorm"),
-    "postgres" -> List("typelevel/skunk", "tpolecat/doobie"),
+    "testing" -> List("scalatest/scalatest", "scalameta/munit", "com-lihaoyi/utest", "etorreborre/specs2", "typelevel/weaver-test", "typelevel/cats-effect-testing"),
+    "database access" -> List("typelevel/doobie", "slick/slick", "typelevel/skunk", "augustnagro/magnum", "playframework/anorm"),
+    "postgres" -> List("typelevel/skunk", "typelevel/doobie"),
     "duckdb" -> List("outr/lightdb"),
-    "configuration" -> List("vlovgr/ciris", "h8io/borscht"),
+    "configuration" -> List("pureconfig/pureconfig", "vlovgr/ciris", "zio/zio-config", "ekrich/sconfig", "h8io/borscht"),
     "functional programming" -> List("typelevel/cats", "zio/zio", "typelevel/cats-effect"),
-    "streaming" -> List("typelevel/fs2", "akka/akka", "apache/pekko"),
+    "streaming" -> List("typelevel/fs2", "akka/akka", "apache/pekko", "zio/zio", "monix/monix"),
     "htp4s" -> List("http4s/http4s"),
     "cirse" -> List("circe/circe"),
     "cats" -> List("typelevel/cats", "typelevel/cats-effect"),
+    "zio" -> List("zio/zio"),
+    "akka" -> List("akka/akka"),
+    "fs2" -> List("typelevel/fs2"),
     "http4s" -> List("http4s/http4s"),
     "http4s-circe" -> List("http4s/http4s"),
     "optics" -> List("optics-dev/monocle"),
@@ -82,13 +87,22 @@ class SearchEvalSuite extends CatsEffectSuite {
     "pretty print" -> List("com-lihaoyi/pprint"),
     "release to sonatype" -> List("sbt/sbt-ci-release"),
     "mutation testing" -> List("stryker-mutator/stryker4s"),
-    "database migrations" -> List("sbt/flyway-sbt"),
+    "database migrations" -> List("flyway/flyway", "sbt/flyway-sbt", "rolang/dumbo", "geirolz/fly4s"),
     "html templates" -> List("com-lihaoyi/scalatags")
   ).map((q, e) => q -> e.map(gh))
 
+  /** Current names of renamed repositories, for databases whose packages
+    * still carry the old ones (the seed predates merging them).
+    */
+  val renamed: Map[String, String] = Map(
+    "tpolecat/doobie" -> "typelevel/doobie",
+    "typesafehub/scala-logging" -> "lightbend/scala-logging",
+    "tpolecat/skunk" -> "typelevel/skunk"
+  ).map((from, to) => gh(from) -> gh(to))
+
   /** The project each result belongs to, in result order, without repeats. */
   def projectsOf(r: SearchResponse): List[String] =
-    r.results.map(_.key).distinct
+    r.results.map(h => renamed.getOrElse(h.key, h.key)).distinct
 
   private val modelDir =
     sys.props
@@ -161,34 +175,39 @@ class SearchEvalSuite extends CatsEffectSuite {
     )
     val grid =
       for
-        k <- List(10, 20, 40)
-        stars <- List(0.05, 0.1, 0.15)
-        deps <- List(0.05, 0.1, 0.2, 0.3)
-        title <- List(0.0, 0.3, 1.0)
+        k <- List(40, 80, 120)
+        stars <- List(0.15, 0.3)
+        deps <- List(0.15, 0.3)
+        prefix <- List(0.2, 0.5, 1.0)
       yield PackageRepo.Ranking(
         rrfK = k,
         starsWeight = stars,
         dependentsWeight = deps,
-        titleWeight = title
+        prefixWeight = prefix
       )
     repos.use { make =>
+      def line(r: PackageRepo.Ranking, s: Score) =
+        f"k ${r.rrfK}%2d  stars ${r.starsWeight}%.2f  dependents ${r.dependentsWeight}%.2f  prefix ${r.prefixWeight}%.1f  title ${r.titleWeight}%.1f  ->  recall@5 ${s.recall}%.3f  MRR ${s.mrr}%.3f"
       grid
-        .traverse(r => evaluate(make(r)).map(r -> _))
+        .traverse(r => evaluate(make(r)).flatTap(s => IO.println(s"tried ${line(r, s)}")).map(r -> _))
         .map { results =>
           results
             .sortBy((_, s) => -(s.recall + s.mrr))
             .take(12)
-            .foreach((r, s) =>
-              println(f"k ${r.rrfK}%2d  stars ${r.starsWeight}%.2f  dependents ${r.dependentsWeight}%.2f  title ${r.titleWeight}%.1f  fields ${r.fieldWeights}  ->  recall@5 ${s.recall}%.3f  MRR ${s.mrr}%.3f")
-            )
+            .foreach((r, s) => println(line(r, s)))
         }
     }
   }
 }
 
 object SearchEvalSuite:
-  // raise these as search improves; they guard against regressions. On the
-  // committed seed (no READMEs), 2026-10-10: recall@5 0.897, MRR 0.950. The
-  // margin allows for small differences in embeddings across CPUs.
-  val recallFloor = 0.85
-  val mrrFloor = 0.92
+  // raise these as search improves; they guard against regressions. The
+  // ranking is tuned on the full index, which the seed is too small to stand
+  // for (`zio` was 27th there among hundreds of zio-* projects); see "Tuning
+  // on the full index" in CLAUDE.md. 2026-10-11, 33 queries:
+  //   full index (8,450 projects): recall@5 0.786, MRR 0.871
+  //   committed seed (no READMEs): recall@5 0.842, MRR 0.889
+  // The floors apply to the seed, which CI runs; the margin allows for small
+  // differences in embeddings across CPUs.
+  val recallFloor = 0.8
+  val mrrFloor = 0.85

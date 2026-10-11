@@ -30,6 +30,7 @@ import com.softinio.scalapkg.db.SeenArtifact
 import com.softinio.scalapkg.depsdev.DepsDev
 import com.softinio.scalapkg.depsdev.VersionInfo
 import com.softinio.scalapkg.domain.*
+import com.softinio.scalapkg.github.RepoText
 import com.softinio.scalapkg.ingest.DepsJob
 import com.softinio.scalapkg.ingest.Enrich
 import com.softinio.scalapkg.ingest.FirstReleases
@@ -153,6 +154,79 @@ class PackageRepoSuite extends CatsEffectSuite {
       search(r, "fastcodec").map { res =>
         assertEquals(keys(res).take(2), List("beta/fastcodec", "alpha/fastcodec"))
       }
+    }
+  }
+
+  test("an established project named what was typed comes first") {
+    withDb { r =>
+      val unboosted = PackageRepo.skunk(
+        r.sessions,
+        ranking = PackageRepo.Ranking(exactNameStars = Int.MaxValue, exactNameDependents = Int.MaxValue)
+      )
+      def plain(q: String) = unboosted.search(SearchQuery(q, Nil, Nil, Sort.Relevance, 1))
+      for
+        zio <- search(r, "zio")
+        zioPlain <- plain("zio")
+        json <- search(r, "json")
+        jsonPlain <- plain("json")
+      yield
+        assertEquals(keys(zio).headOption, Some("zio/zio"), keys(zio))
+        // on relevance alone a project with zio all over its text wins
+        assertNotEquals(keys(zioPlain).headOption, Some("zio/zio"), keys(zioPlain))
+        // a tiny repo called json is not established, so nothing changes
+        assertEquals(keys(json), keys(jsonPlain))
+    }
+  }
+
+  test("a project that moved to a new groupId is shown by its new coordinates") {
+    withDb { r =>
+      for
+        starred <- r.search.mostStarred(50)
+        newest <- r.search.newest(50)
+        found <- search(r, "playframework")
+      yield
+        // the old group has more targets and dependents
+        assertEquals(starred.find(_.name == "play").map(_.groupId), Some("org.playframework"))
+        assertEquals(newest.find(_.name == "play").map(_.groupId), Some("org.playframework"))
+        assertEquals(found.results.headOption.map(_.primary.groupId), Some("org.playframework"))
+    }
+  }
+
+  test("a renamed repository's packages join the project it moved to") {
+    withDb { r =>
+      def skunks(res: SearchResponse) = keys(res).filter(_.endsWith("/skunk")).sorted
+      for
+        throttle <- Throttle(0.millis)
+        depsDev = DepsDev(Client.fromHttpApp(HttpApp.notFound[IO]), Uri.unsafeFromString("http://deps.test"), throttle)
+        before <- search(r, "skunk")
+        _ <- r.ingest.saveGithub(
+          List(RepoText("github.com/tpolecat/skunk", Nil, None, movedTo = Some("github.com/typelevel/skunk")))
+        )
+        after <- search(r, "skunk")
+        // regrouping from the artifacts, which still name the old repository,
+        // keeps the move
+        _ <- Enrich(depsDev, r.ingest).rebuild(List(PackageRef("org.tpolecat", "skunk-macros")))
+        project <- r.sessions.use(_.unique(sql"SELECT project_id FROM packages WHERE name = 'skunk-macros'".query(text)))
+      yield
+        assertEquals(skunks(before), List("tpolecat/skunk", "typelevel/skunk"))
+        assertEquals(skunks(after), List("typelevel/skunk"))
+        assertEquals(project, "github.com/typelevel/skunk")
+    }
+  }
+
+  test("old names that moved to an unindexed repository become one result") {
+    withDb { r =>
+      def logkits(res: SearchResponse) = keys(res).filter(_.endsWith("/logkit")).sorted
+      for
+        before <- search(r, "logkit")
+        _ <- r.ingest.saveGithub(
+          List("github.com/old1/logkit", "github.com/old2/logkit")
+            .map(RepoText(_, Nil, None, movedTo = Some("github.com/new/logkit")))
+        )
+        after <- search(r, "logkit")
+      yield
+        assertEquals(logkits(before), List("old1/logkit", "old2/logkit"))
+        assertEquals(logkits(after), List("old1/logkit"))
     }
   }
 
@@ -412,7 +486,16 @@ class PackageRepoSuite extends CatsEffectSuite {
       ('github.com/new/fresh', 'A brand new effect library', 5, NULL, now() - interval '20 days', NULL, '{}'),
       ('github.com/sbt/sbt-testng', 'TestNG support for sbt', 30, NULL, now() - interval '12 years', NULL, '{}'),
       ('github.com/new/undated', 'Another new library', 5, NULL, now() - interval '30 days', NULL, '{}'),
-      ('github.com/new/oldish', 'An older library', 5, NULL, now() - interval '1 year', NULL, '{}')""",
+      ('github.com/new/oldish', 'An older library', 5, NULL, now() - interval '1 year', NULL, '{}'),
+      ('github.com/zio/zio', 'Type-safe, composable asynchronous and concurrent programming for Scala', 200, NULL, now() - interval '9 years', NULL, '{}'),
+      ('github.com/zio/zio-kafka', 'A Kafka client for ZIO and ZIO Streams', 400, NULL, now() - interval '6 years',
+       'Kafka consumer and producer for ZIO applications, built on ZIO Streams.', '{zio,kafka}'),
+      ('github.com/tiny/json', 'json', 3, NULL, now() - interval '2 years', NULL, '{}'),
+      ('github.com/playframework/playframework', 'Play Framework', 12600, NULL, now() - interval '15 years', NULL, '{}'),
+      ('github.com/tpolecat/skunk', 'A data access library for Scala and Postgres', 1500, NULL, now() - interval '7 years', NULL, '{}'),
+      ('github.com/typelevel/skunk', 'A data access library for Scala and Postgres', 1660, NULL, now() - interval '7 years', NULL, '{}'),
+      ('github.com/old1/logkit', 'Logging toolkit', 20, NULL, now() - interval '9 years', NULL, '{}'),
+      ('github.com/old2/logkit', 'Logging toolkit', 20, NULL, now() - interval '9 years', NULL, '{}')""",
     """INSERT INTO packages (group_id, name, project_id, latest_version, latest_release_at, targets, platforms, scala_versions) VALUES
       ('io.circe', 'circe-core', 'github.com/circe/circe', '0.14.0', now() - interval '5 days', '{jvm:3,jvm:2.13}', '{jvm}', '{3,2.13}'),
       ('io.circe', 'circe-testing', 'github.com/circe/circe', '0.14.0', now() - interval '1 day', '{jvm:3,jvm:2.13}', '{jvm}', '{3,2.13}'),
@@ -430,7 +513,17 @@ class PackageRepoSuite extends CatsEffectSuite {
       ('io.undated', 'undated-core', 'github.com/new/undated', '0.1.0', now() - interval '5 days', '{jvm:3}', '{jvm}', '{3}'),
       ('io.undated', 'undated-extra', 'github.com/new/undated', '0.1.0', now() - interval '5 days', '{jvm:3}', '{jvm}', '{3}'),
       ('io.oldish', 'oldish-core', 'github.com/new/oldish', '1.0.0', now() - interval '20 days', '{jvm:3}', '{jvm}', '{3}'),
-      ('io.solo', 'solo-lib', NULL, '0.1.0', now() - interval '3 days', '{jvm:3}', '{jvm}', '{3}')""",
+      ('io.solo', 'solo-lib', NULL, '0.1.0', now() - interval '3 days', '{jvm:3}', '{jvm}', '{3}'),
+      ('dev.zio', 'zio', 'github.com/zio/zio', '2.1.0', now() - interval '5 days', '{jvm:3,jvm:2.13}', '{jvm}', '{3,2.13}'),
+      ('dev.zio', 'zio-kafka', 'github.com/zio/zio-kafka', '3.0.0', now() - interval '5 days', '{jvm:3,jvm:2.13}', '{jvm}', '{3,2.13}'),
+      ('io.tiny', 'json', 'github.com/tiny/json', '0.1.0', now() - interval '400 days', '{jvm:3,jvm:2.13}', '{jvm}', '{3,2.13}'),
+      ('com.typesafe.play', 'play', 'github.com/playframework/playframework', '2.9.12', now() - interval '11 days',
+       '{jvm:2.11,jvm:2.12,jvm:2.13,jvm:3}', '{jvm}', '{2.11,2.12,2.13,3}'),
+      ('org.playframework', 'play', 'github.com/playframework/playframework', '3.0.12', now() - interval '10 days', '{jvm:3,jvm:2.13}', '{jvm}', '{3,2.13}'),
+      ('org.tpolecat', 'skunk-macros', 'github.com/tpolecat/skunk', '0.0.7', now() - interval '5 years', '{jvm:2.13}', '{jvm}', '{2.13}'),
+      ('org.tpolecat', 'skunk-core', 'github.com/typelevel/skunk', '1.0.0', now() - interval '5 days', '{jvm:3,jvm:2.13}', '{jvm}', '{3,2.13}'),
+      ('io.old1', 'logkit-core', 'github.com/old1/logkit', '1.0.0', now() - interval '5 years', '{jvm:2.13}', '{jvm}', '{2.13}'),
+      ('io.old2', 'logkit-api', 'github.com/old2/logkit', '2.0.0', now() - interval '2 years', '{jvm:2.13}', '{jvm}', '{2.13}')""",
     """INSERT INTO artifacts (group_id, artifact_id, name, target, latest_version, project_id, first_release_at) VALUES
       ('io.circe', 'circe-core_3', 'circe-core', 'jvm:3', '0.14.0', 'github.com/circe/circe', now() - interval '5 years'),
       ('io.fresh', 'fresh-core_3', 'fresh-core', 'jvm:3', '0.1.0', 'github.com/new/fresh', now() - interval '10 days'),
@@ -438,10 +531,27 @@ class PackageRepoSuite extends CatsEffectSuite {
       ('io.undated', 'undated-core_3', 'undated-core', 'jvm:3', '0.1.0', 'github.com/new/undated', now() - interval '5 days'),
       ('io.undated', 'undated-extra_3', 'undated-extra', 'jvm:3', '0.1.0', 'github.com/new/undated', NULL),
       ('io.oldish', 'oldish-core_3', 'oldish-core', 'jvm:3', '1.0.0', 'github.com/new/oldish', now() - interval '200 days'),
-      ('io.solo', 'solo-lib_3', 'solo-lib', 'jvm:3', '0.1.0', NULL, now() - interval '3 days')""",
-    // circe-core is what other projects depend on
+      ('io.solo', 'solo-lib_3', 'solo-lib', 'jvm:3', '0.1.0', NULL, now() - interval '3 days'),
+      ('com.typesafe.play', 'play_2.13', 'play', 'jvm:2.13', '2.9.12', 'github.com/playframework/playframework', now() - interval '12 years'),
+      ('org.playframework', 'play_3', 'play', 'jvm:3', '3.0.12', 'github.com/playframework/playframework', now() - interval '2 years'),
+      ('org.tpolecat', 'skunk-macros_2.13', 'skunk-macros', 'jvm:2.13', '0.0.7', 'github.com/tpolecat/skunk', now() - interval '5 years')""",
+    // thirty zio-* projects with zio all over their text and nearly as many
+    // stars, which push zio/zio down the keyword list as the hundreds of them
+    // do in the full index
+    """INSERT INTO projects (id, description, stars, summary, summary_keywords)
+       SELECT 'github.com/zio/zio-mod' || i, 'ZIO integration for ZIO: ZIO layers, ZIO streams and ZIO tests for ZIO apps', 150,
+              'Connects ZIO applications to a service with ZIO layers and ZIO streams.', '{zio,zio-streams,zio-layers}'
+       FROM generate_series(1, 30) i""",
+    """INSERT INTO packages (group_id, name, project_id, latest_version, latest_release_at, targets, platforms, scala_versions)
+       SELECT 'dev.zio', 'zio-mod' || i, 'github.com/zio/zio-mod' || i, '1.0.0', now() - interval '30 days',
+              '{jvm:3,jvm:2.13}', '{jvm}', '{3,2.13}'
+       FROM generate_series(1, 30) i""",
+    // circe-core is what other projects depend on, and the old play group
+    // more than the new one
     """INSERT INTO package_deps (group_id, name, dep_group_id, dep_name) VALUES
       ('com.acme', 'cachey', 'io.circe', 'circe-core'),
-      ('com.beta', 'fastcodec', 'io.circe', 'circe-core')"""
+      ('com.beta', 'fastcodec', 'io.circe', 'circe-core'),
+      ('com.acme', 'cachey', 'com.typesafe.play', 'play'),
+      ('com.beta', 'fastcodec', 'com.typesafe.play', 'play')"""
   )
 }

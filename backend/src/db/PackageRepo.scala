@@ -95,17 +95,28 @@ object PackageRepo:
 
   def isSingleTerm(tsq: String): Boolean = !tsq.contains(" & ")
 
+  /** The same terms as whole words: `testing` but not `testcontainers`. */
+  def wholeWords(tsq: String): String = tsq.replace(":*", "")
+
+  /** A name as compared with a query: lower case, separators as single spaces,
+    * so `cats effect` is the name `cats-effect`.
+    */
+  def nameWords(s: String): String =
+    s.toLowerCase.split("[-_. ]+").filter(_.nonEmpty).mkString(" ")
+
   /** The same terms matched against module names only (weight A of a package's
     * own search vector).
     */
   def nameQuery(tsq: String): String = tsq.replace(":*", ":*A")
 
-  /** Ranking knobs, tuned with `SearchEvalSuite` against the dev seed.
+  /** Ranking knobs, tuned with `SearchEvalSuite` against the full index.
     *
     * @param rrfK
     *   keyword and semantic candidates are fused with reciprocal rank fusion,
     *   score = sum over lists of 1 / (k + rank); a smaller k makes rank count
-    *   for more against the stars nudge
+    *   for more against popularity. Hundreds of projects match a word like
+    *   `testing` about equally well, so their order in the keyword list says
+    *   little and a large k lets popularity pick among them
     * @param starsWeight
     * @param dependentsWeight
     *   relevance is multiplied by 1 + starsWeight * ln(1 + stars) +
@@ -120,6 +131,16 @@ object PackageRepo:
     *   word from outranking a project named after it, and B as high as A lets a
     *   JSON library (circe) compete with projects that only have `json` in
     *   their name
+    * @param prefixWeight
+    *   share of the keyword score that prefix matches add to whole-word ones.
+    *   Prefixes find what is still being typed (`cir` finds circe), but the
+    *   stemmed `test:*` also matches every `testcontainers-*` project, which
+    *   would bury the testing libraries
+    * @param exactNameStars
+    * @param exactNameDependents
+    *   a project whose name is the query (`zio`, `cats-effect`) comes first
+    *   when it has this many GitHub stars or dependents; a tiny repo that
+    *   happens to be called `json` does not
     * @param scala3Only
     * @param scala213Only
     * @param scalaOlder
@@ -130,11 +151,14 @@ object PackageRepo:
     *   build tool
     */
   final case class Ranking(
-      rrfK: Int = 10,
-      starsWeight: Double = 0.15,
+      rrfK: Int = 80,
+      starsWeight: Double = 0.3,
       dependentsWeight: Double = 0.3,
       titleWeight: Double = 0.3,
       fieldWeights: (Double, Double, Double, Double) = (0.03, 0.2, 1.0, 1.0),
+      prefixWeight: Double = 0.5,
+      exactNameStars: Int = 100,
+      exactNameDependents: Int = 10,
       scala3Only: Double = 0.9,
       scala213Only: Double = 0.7,
       scalaOlder: Double = 0.4
@@ -244,14 +268,28 @@ object PackageRepo:
         // the model knows phrases ("parse markdown"), not library names:
         // for a single word it only steps in when nothing matches it
         val semanticOnlyAsFallback = PackageRepo.isSingleTerm(tsq)
+        val whole = PackageRepo.wholeWords(tsq)
         val keywordScore =
           sql"""(greatest(ts_rank(#${ranking.weightsArray}, d.search, to_tsquery('simple', $text)),
                           ts_rank(#${ranking.weightsArray}, d.search, to_tsquery('english', $text)))
+                 + $float8 * greatest(ts_rank(#${ranking.weightsArray}, d.search, to_tsquery('simple', $text)),
+                                      ts_rank(#${ranking.weightsArray}, d.search, to_tsquery('english', $text)))
                  + $float8 * similarity(d.title, $text)
                  -- whole words beat prefixes: `json` prefers zio-json over jsoniter
                  + (CASE WHEN d.search @@ plainto_tsquery('english', $text)
                          THEN 0.5 ELSE 0 END))"""
-            .apply((tsq, tsq, ranking.titleWeight, q, q))
+            .apply(
+              (
+                whole,
+                whole,
+                ranking.prefixWeight,
+                tsq,
+                tsq,
+                ranking.titleWeight,
+                q,
+                q
+              )
+            )
         val keywordMatch =
           sql"""(d.search @@ to_tsquery('simple', $text)
                  OR d.search @@ to_tsquery('english', $text)
@@ -314,13 +352,24 @@ object PackageRepo:
           case Sort.Recent =>
             void" ORDER BY d.latest_release_at DESC NULLS LAST, h.score DESC, d.key"
           case Sort.Relevance =>
-            // relevance first; stars only nudge, so a precise match from a
-            // small project still beats a vague one from a famous project
-            // (a bonus for exact names lost to plain relevance in the
-            // evaluation: a tiny repo called `json` beat every JSON library)
-            // a typo match ranks below real word matches, however popular;
-            // when the query itself is misspelled all matches are typos
-            void" ORDER BY h.score" |+|
+            // an established project named exactly what was typed first:
+            // among thousands of `zio-*` projects, `zio` means zio/zio
+            // (only established ones, or a tiny repo called `json` would
+            // beat every JSON library); then relevance, which stars only
+            // nudge, so a precise match from a small project still beats a
+            // vague one from a famous project. A typo match ranks below
+            // real word matches, however popular; when the query itself is
+            // misspelled all matches are typos
+            sql""" ORDER BY (regexp_replace(lower(d.title), '[-_. ]+', ' ', 'g') = $text
+                             AND (coalesce(pr.stars, 0) >= $int4
+                                  OR d.dependents >= $int4)) DESC, h.score"""
+              .apply(
+                (
+                  PackageRepo.nameWords(query.q),
+                  ranking.exactNameStars,
+                  ranking.exactNameDependents
+                )
+              ) |+|
               sql" * #${ranking.popularity} * #${ranking.scalaSupport} * "
                 .apply(Void) |+|
               docDeprecatedPenalty |+|
@@ -361,7 +410,8 @@ object PackageRepo:
       private val shownModules = 6
 
       /** The modules shown under each result: those whose name matches the
-        * query first, then the project's main modules.
+        * query first, then those not under a groupId the project moved away
+        * from, then the project's main modules.
         */
       private def withModules(
           docs: List[DocRow],
@@ -376,19 +426,21 @@ object PackageRepo:
                      OR p.search @@ to_tsquery('english', $text))"""
                 .apply((t, t))
             case None => void"false"
+          val keys = docs.map(_.key)
           val af =
-            void"SELECT " |+| columns(Void) |+|
+            movedGroups(Some(keys)) |+| void"SELECT " |+| columns(Void) |+|
               void", p.doc_key, p.n FROM (SELECT p.*, row_number() OVER (" |+|
               void"PARTITION BY p.doc_key ORDER BY " |+| nameMatch |+|
-              void""" DESC, p.deprecated, p.name = d.title DESC,
+              void""" DESC, p.deprecated,
+                     (p.doc_key, p.group_id) IN (SELECT doc_key, group_id FROM moved),
+                     p.name = d.title DESC,
                      cardinality(p.targets) DESC,
                      p.latest_release_at DESC NULLS LAST,
                      length(p.name), p.name) AS pos,
                    count(*) OVER (PARTITION BY p.doc_key)::int4 AS n
                    FROM packages p JOIN search_docs d ON d.key = p.doc_key
                    WHERE """ |+|
-              sql"p.doc_key = ANY(${IngestRepo.textList})"
-                .apply(docs.map(_.key)) |+|
+              sql"p.doc_key = ANY(${IngestRepo.textList})".apply(keys) |+|
               and(facetConditions(query, "p")) |+|
               void") p LEFT JOIN projects pr ON pr.id = p.project_id" |+|
               sql" WHERE p.pos <= $int4 ORDER BY p.pos".apply(shownModules)
@@ -492,13 +544,39 @@ object PackageRepo:
           summary
         ).map(_.headOption)
 
-      /** A project's main module: the one most depended on, then the one that
-        * is not a test, benchmark or internal module, then the one with the
-        * most targets, then the shortest name (`cats-core` rather than
-        * `cats-testkit`).
+      /** `WITH moved`: the groupIds of projects that republished their modules
+        * under a newer one (`org.playframework` after `com.typesafe.play`), so
+        * the old coordinates stop standing for the project: a module whose name
+        * the project also publishes under another groupId, first released there
+        * later. `docs` limits it to these search documents.
+        */
+      private def movedGroups(docs: Option[List[String]]): AppliedFragment =
+        // grouping, not a self-join: sorting 36k text keys for a merge join
+        // took 250 ms, and the home page asks three times
+        val inDocs = docs.fold(AppliedFragment.empty)(keys =>
+          sql" WHERE doc_key = ANY(${IngestRepo.textList})".apply(keys)
+        )
+        void"""WITH moved AS MATERIALIZED (
+                 SELECT DISTINCT doc_key, group_id FROM (
+                   SELECT p.doc_key, p.group_id, f.first_at,
+                          max(f.first_at) OVER (PARTITION BY p.doc_key, p.name) AS newest
+                   FROM packages p
+                   CROSS JOIN LATERAL (SELECT min(a.first_release_at) AS first_at
+                                       FROM artifacts a
+                                       WHERE a.group_id = p.group_id AND a.name = p.name) f
+                   WHERE (p.doc_key, p.name) IN (SELECT doc_key, name FROM packages""" |+|
+          inDocs |+| void""" GROUP BY doc_key, name HAVING count(*) > 1)) x
+                 WHERE first_at < newest) """
+
+      /** A project's main module: not under a groupId the project moved away
+        * from, then the one most depended on, then the one that is not a test,
+        * benchmark or internal module, then the one with the most targets, then
+        * the shortest name (`cats-core` rather than `cats-testkit`). Needs
+        * [[movedGroups]].
         */
       private val mainModuleOrder =
-        void"""p.dependents DESC,
+        void"""(p.doc_key, p.group_id) IN (SELECT doc_key, group_id FROM moved),
+               p.dependents DESC,
                p.name ~ '(^|-)(tests?|testing|testkit|bench|benchmarks?|jmh|internal|examples?|demo)($$|-)',
                cardinality(p.targets) DESC, length(p.name), p.name"""
 
@@ -506,7 +584,7 @@ object PackageRepo:
         // one row per project (a tapir release publishes dozens of modules),
         // showing the main module among those in its latest release
         list(
-          void"SELECT " |+| columns(Void) |+|
+          movedGroups(None) |+| void"SELECT " |+| columns(Void) |+|
             void""" FROM (SELECT p.*, row_number() OVER (PARTITION BY p.doc_key
                            ORDER BY p.in_latest DESC, """ |+| mainModuleOrder |+|
             void""") AS rn
@@ -523,7 +601,7 @@ object PackageRepo:
       def mostStarred(limit: Int): IO[List[PackageSummary]] =
         // one package per project, so a big repo does not fill the list
         list(
-          void"SELECT " |+| columns(Void) |+|
+          movedGroups(None) |+| void"SELECT " |+| columns(Void) |+|
             void""" FROM (SELECT p.*, row_number() OVER (PARTITION BY p.project_id
                            ORDER BY """ |+| mainModuleOrder |+|
             void""") AS rn
@@ -547,7 +625,7 @@ object PackageRepo:
         // shown as new, and so is one whose repository is more than a year
         // older than that release (it moved to new Maven coordinates)
         list(
-          void"SELECT " |+| columns(Void) |+| void""", f.first_at
+          movedGroups(None) |+| void"SELECT " |+| columns(Void) |+| void""", f.first_at
                  FROM (SELECT p.doc_key, min(a.first_release_at) AS first_at
                        FROM packages p
                        JOIN artifacts a ON a.group_id = p.group_id AND a.name = p.name

@@ -31,20 +31,24 @@ import scala.concurrent.duration.*
 class GitHubSuite extends CatsEffectSuite {
 
   // shaped like a GraphQL answer for one aliased repository
-  private val answer =
+  private def answer(nameWithOwner: String) =
     """{"data":{"r0":{
       |  "createdAt":"2013-10-20T09:15:00Z",
+      |  "nameWithOwner":"NAME",
       |  "repositoryTopics":{"nodes":[{"topic":{"name":"sbt"}},{"topic":{"name":"testng"}}]},
       |  "md":{"text":"# sbt-testng\n\nRun TestNG tests from sbt."}
-      |}}}""".stripMargin
+      |}}}""".stripMargin.replace("NAME", nameWithOwner)
+
+  private def fetch(id: String, nameWithOwner: String) =
+    val app = HttpApp[IO](_ =>
+      IO.pure(Response[IO](Status.Ok).withEntity(answer(nameWithOwner)))
+    )
+    Throttle(0.millis).flatMap(throttle =>
+      GitHub(Client.fromHttpApp(app), "token", throttle).fetch(List(id))
+    )
 
   test("repository topics, README and creation date are read from GraphQL") {
-    val app = HttpApp[IO](_ => IO.pure(Response[IO](Status.Ok).withEntity(answer)))
-    for
-      throttle <- Throttle(0.millis)
-      repos <- GitHub(Client.fromHttpApp(app), "token", throttle)
-        .fetch(List("github.com/sbt/sbt-testng"))
-    yield
+    fetch("github.com/sbt/sbt-testng", "sbt/sbt-testng").map { repos =>
       val repo = repos.head
       assertEquals(repo.topics, List("sbt", "testng"))
       assert(repo.readme.exists(_.contains("Run TestNG tests")), repo.readme)
@@ -52,5 +56,13 @@ class GitHubSuite extends CatsEffectSuite {
         repo.createdAt,
         Some(OffsetDateTime.parse("2013-10-20T09:15:00Z"))
       )
+      assertEquals(repo.movedTo, None)
+    }
+  }
+
+  test("a renamed or transferred repository reports where it went") {
+    fetch("github.com/tpolecat/skunk", "Typelevel/Skunk").map(repos =>
+      assertEquals(repos.head.movedTo, Some("github.com/typelevel/skunk"))
+    )
   }
 }

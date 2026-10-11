@@ -32,12 +32,18 @@ import org.http4s.headers.Authorization
 
 import java.time.OffsetDateTime
 
-/** Topics and README text of one GitHub repository. */
+/** Topics and README text of one GitHub repository.
+  *
+  * @param movedTo
+  *   the repository's current id when it was renamed or transferred, e.g.
+  *   `github.com/typelevel/skunk` for `github.com/tpolecat/skunk`
+  */
 final case class RepoText(
     projectId: String,
     topics: List[String],
     readme: Option[String],
-    createdAt: Option[OffsetDateTime] = None
+    createdAt: Option[OffsetDateTime] = None,
+    movedTo: Option[String] = None
 )
 
 /** Reads topics and READMEs through the GitHub GraphQL API, many repositories
@@ -93,6 +99,7 @@ final class GitHub(client: Client[IO], token: String, throttle: Throttle):
         .mkString("\n")
       s"""r$i: repository(owner: "$owner", name: "$name") {
          |  createdAt
+         |  nameWithOwner
          |  repositoryTopics(first: 20) { nodes { topic { name } } }
          |  $readmes
          |}""".stripMargin
@@ -118,11 +125,19 @@ final class GitHub(client: Client[IO], token: String, throttle: Throttle):
           .headOption
           .map(Readme.clean)
           .filter(_.nonEmpty)
+        // GitHub answers for the old name of a moved repository with the
+        // new one; ids are lower case
+        val movedTo = repo
+          .get[String]("nameWithOwner")
+          .toOption
+          .map(n => s"github.com/${n.toLowerCase}")
+          .filter(_ != id.toLowerCase)
         RepoText(
           id,
           topics,
           readme,
-          repo.get[OffsetDateTime]("createdAt").toOption
+          repo.get[OffsetDateTime]("createdAt").toOption,
+          movedTo
         )
       }
     }
