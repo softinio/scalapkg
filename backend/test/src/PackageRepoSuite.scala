@@ -34,6 +34,7 @@ import com.softinio.scalapkg.github.RepoText
 import com.softinio.scalapkg.ingest.DepsJob
 import com.softinio.scalapkg.ingest.Enrich
 import com.softinio.scalapkg.ingest.FirstReleases
+import com.softinio.scalapkg.ingest.Freshness
 import com.softinio.scalapkg.ingest.Throttle
 import munit.CatsEffectSuite
 import org.http4s.HttpApp
@@ -356,6 +357,49 @@ class PackageRepoSuite extends CatsEffectSuite {
     }
   }
 
+  test("a recheck replaces a stray higher version and clears the mark") {
+    withDb { r =>
+      def at(d: String) = Some(Instant.parse(s"${d}T00:00:00Z"))
+      val ref = PackageRef("io.stray", "stray")
+      val versions =
+        """{"versions":[
+          |  {"versionKey":{"version":"3.0.7"},"publishedAt":"2023-05-02T00:00:00Z"},
+          |  {"versionKey":{"version":"0.19.0"},"publishedAt":"2025-05-12T00:00:00Z"},
+          |  {"versionKey":{"version":"1.0.0-RC7"},"publishedAt":"2026-09-29T00:00:00Z"}]}""".stripMargin
+      val depsDevApp = HttpApp[IO] { req =>
+        val path = req.uri.path.renderString
+        IO.pure(
+          if path.endsWith("io.stray%3Astray_3") || path.endsWith("io.stray:stray_3")
+          then Response[IO](Status.Ok).withEntity(versions)
+          else Response[IO](Status.NotFound)
+        )
+      }
+      def marked = r.sessions.use(
+        _.unique(sql"SELECT recheck_versions FROM packages WHERE group_id = 'io.stray'".query(bool))
+      )
+      for
+        throttle <- Throttle(0.millis)
+        depsDev = DepsDev(Client.fromHttpApp(depsDevApp), Uri.unsafeFromString("http://deps.test"), throttle)
+        _ <- r.ingest.upsertSeen(
+          List(
+            SeenArtifact("io.stray", "stray_3", "stray", Target(Platform.Jvm, "3"), "3.0.7", at("2023-05-02")),
+            SeenArtifact("io.stray", "stray_native0.5_3", "stray", Target(Platform.ScalaNative("0.5"), "3"), "0.19.0", at("2025-05-12"))
+          )
+        )
+        _ <- Enrich(depsDev, r.ingest).rebuild(List(ref))
+        // regrouping already prefers the release two years later
+        before <- r.search.get(ref)
+        _ <- r.sessions.use(_.execute(sql"UPDATE packages SET recheck_versions = true WHERE group_id = 'io.stray'".command))
+        _ <- Freshness(depsDev, r.ingest, 1000).run
+        after <- r.search.targetVersions(ref)
+        stillMarked <- marked
+      yield
+        assertEquals(before.map(_.latestVersion), Some("0.19.0"))
+        assertEquals(after.map((t, v) => t.key -> v), Map("jvm:3" -> "0.19.0", "native0.5:3" -> "0.19.0"))
+        assert(!stillMarked)
+    }
+  }
+
   test("a freshness result never replaces a newer version recorded meanwhile") {
     withDb { r =>
       val jvm3 = Target(Platform.Jvm, "3")
@@ -368,7 +412,10 @@ class PackageRepoSuite extends CatsEffectSuite {
           List(NewerVersion("io.race", "raced_3", "1.0", "1.1"), NewerVersion("io.race", "calm_3", "1.0", "1.1"))
         )
         latest <- r.ingest.latestVersions(List(ArtifactKey("io.race", "raced_3"), ArtifactKey("io.race", "calm_3")))
-      yield assertEquals(latest, Map(ArtifactKey("io.race", "raced_3") -> "1.2", ArtifactKey("io.race", "calm_3") -> "1.1"))
+      yield assertEquals(
+        latest.view.mapValues(_._1).toMap,
+        Map(ArtifactKey("io.race", "raced_3") -> "1.2", ArtifactKey("io.race", "calm_3") -> "1.1")
+      )
     }
   }
 

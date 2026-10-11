@@ -34,6 +34,7 @@ import skunk.implicits.*
 
 import java.time.Instant
 import java.time.OffsetDateTime
+import java.time.ZoneOffset
 
 /** How far `IndexSync` has read the Maven index: the index chain (a new one
   * means Central rebuilt the index) and the last incremental chunk applied.
@@ -51,12 +52,15 @@ final case class SeenArtifact(
 ):
   def key: ArtifactKey = ArtifactKey(groupId, artifactId)
 
-/** A newer version found for an artifact last seen at `compared`. */
+/** A newer version found for an artifact last seen at `compared`, released at
+  * `releasedAt`.
+  */
 final case class NewerVersion(
     groupId: String,
     artifactId: String,
     compared: String,
-    version: String
+    version: String,
+    releasedAt: Option[Instant] = None
 )
 
 /** An artifact whose latest version `Enrich` still has to look up. */
@@ -130,12 +134,19 @@ final class IngestRepo(sessions: Resource[IO, Session[IO]]):
       (c.chainId, c.lastIncremental)
     )
 
-  def latestVersions(keys: List[ArtifactKey]): IO[Map[ArtifactKey, String]] =
+  /** Each artifact's latest version and when it was released, if known. */
+  def latestVersions(
+      keys: List[ArtifactKey]
+  ): IO[Map[ArtifactKey, (String, Option[Instant])]] =
     byKeys(keys)(
-      sql"""SELECT group_id, artifact_id, latest_version
+      sql"""SELECT group_id, artifact_id, latest_version, latest_release_at
             FROM artifacts WHERE (group_id, artifact_id) $artifactIn"""
-        .query(text *: text *: text)
-    ).map(_.map((g, a, v) => ArtifactKey(g, a) -> v).toMap)
+        .query(text *: text *: text *: timestamptz.opt)
+    ).map(
+      _.map((g, a, v, at) =>
+        ArtifactKey(g, a) -> (v, at.map(_.toInstant))
+      ).toMap
+    )
 
   /** Adds new artifacts and records new latest versions from the index, marking
     * each for `Enrich` to look up.
@@ -143,16 +154,28 @@ final class IngestRepo(sessions: Resource[IO, Session[IO]]):
   def upsertSeen(artifacts: List[SeenArtifact]): IO[Unit] =
     batched(artifacts) { batch =>
       val enc =
-        (text *: text *: text *: target *: text).values.list(batch.size)
+        (text *: text *: text *: target *: text *: timestamptz.opt).values
+          .list(batch.size)
       run(
         sql"""INSERT INTO artifacts
-                (group_id, artifact_id, name, target, latest_version)
+                (group_id, artifact_id, name, target, latest_version,
+                 latest_release_at)
               VALUES $enc
               ON CONFLICT (group_id, artifact_id) DO UPDATE
               SET latest_version = EXCLUDED.latest_version,
+                  latest_release_at = EXCLUDED.latest_release_at,
                   needs_refresh = true,
                   refreshed_at = NULL""".command,
-        batch.map(a => (a.groupId, a.artifactId, a.name, a.target, a.version))
+        batch.map(a =>
+          (
+            a.groupId,
+            a.artifactId,
+            a.name,
+            a.target,
+            a.version,
+            a.publishedAt.map(_.atOffset(ZoneOffset.UTC))
+          )
+        )
       )
     }
 
@@ -164,17 +187,19 @@ final class IngestRepo(sessions: Resource[IO, Session[IO]]):
       run(
         sql"""UPDATE artifacts a
               SET latest_version = v.new,
+                  latest_release_at = nullif(v.at, '')::timestamptz,
                   needs_refresh = true,
                   refreshed_at = NULL
-              FROM unnest($textList, $textList, $textList, $textList)
-                AS v(g, id, old, new)
+              FROM unnest($textList, $textList, $textList, $textList, $textList)
+                AS v(g, id, old, new, at)
               WHERE (a.group_id, a.artifact_id) = (v.g, v.id)
                 AND a.latest_version = v.old""".command,
         (
           batch.map(_.groupId),
           batch.map(_.artifactId),
           batch.map(_.compared),
-          batch.map(_.version)
+          batch.map(_.version),
+          batch.map(_.releasedAt.fold("")(_.toString))
         )
       )
     }
@@ -700,6 +725,24 @@ final class IngestRepo(sessions: Resource[IO, Session[IO]]):
             WHERE latest_release_at >= now() - interval '365 days'
             LIMIT $int4""",
       limit
+    )
+
+  /** Packages whose every artifact's versions are to be asked again, marked by
+    * migration V4 after the choice of latest version changed.
+    */
+  def toRecheck(limit: Int): IO[List[DepsTarget]] =
+    withArtifacts(
+      sql"SELECT * FROM packages WHERE recheck_versions LIMIT $int4",
+      limit
+    )
+
+  def rechecked(packages: List[PackageRef]): IO[Unit] =
+    batched(packages)(batch =>
+      run(
+        sql"""UPDATE packages SET recheck_versions = false
+              WHERE (group_id, name) $packageIn""".command,
+        batch
+      )
     )
 
   /** The packages `choose` selects, each with all its artifacts. */

@@ -100,6 +100,15 @@ styles.
   weekly (only for projects some artifact still links).
 - freshness (daily): asks deps.dev for newer versions of packages released in
   the last year, since the index is published only every couple of weeks.
+  With what is left of its limit it asks again for every artifact of
+  packages marked `recheck_versions` (migration V4 marked them all once,
+  after the latest-version rule below changed), then clears the mark.
+
+`MavenVersions` picks an artifact's latest version: stable over pre-release
+(RC, M, snapshots, `SNAP`, builds named after a commit such as dynver's
+`1.0-234-d1a2b53`), then the highest number, except that one released more
+than a year after a higher one wins (kyo-core's stray 3.0.7 lost to 0.19.0).
+Every job that compares versions passes their release dates.
 - deps (hourly): deps.dev requirements → dependency edges → dependents counts
   (deps.dev serves no dependents for Maven).
 - first-releases (5 min): deps.dev fallback for artifacts the index never

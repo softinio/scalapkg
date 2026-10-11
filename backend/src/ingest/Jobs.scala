@@ -35,6 +35,7 @@ import com.softinio.scalapkg.summary.Summaries
 import fs2.Stream
 import org.typelevel.log4cats.Logger
 
+import java.time.Instant
 import java.time.OffsetDateTime
 import scala.concurrent.duration.*
 import scala.util.Try
@@ -131,7 +132,7 @@ final class IndexSync(
   private def record(seen: List[SeenArtifact]): IO[Int] =
     val groups = seen.groupBy(_.key).toList
     val best = groups.flatMap((_, group) =>
-      group.toNel.map(MavenVersions.best(_)(_.version))
+      group.toNel.map(MavenVersions.best(_)(_.version, _.publishedAt))
     )
     // the earliest publish time of any version seen, kept even when no
     // version is new: a full read sees every version an artifact ever had
@@ -142,7 +143,9 @@ final class IndexSync(
       val changed = best.filter(a =>
         existing
           .get(a.key)
-          .forall(cur => MavenVersions.isBetter(a.version, cur))
+          .forall((cur, curAt) =>
+            MavenVersions.isBetter(a.version, a.publishedAt, cur, curAt)
+          )
       )
       (repo.upsertSeen(changed) *> repo.noteFirstReleases(firsts))
         .as(changed.size)
@@ -251,7 +254,8 @@ object Enrich:
 
   /** Combines the artifacts of one package into its search row. */
   def packageRow(arts: NonEmptyList[ArtifactRow]): PackageRow =
-    val version = MavenVersions.best(arts)(_.version).version
+    val version =
+      MavenVersions.best(arts)(_.version, _.releasedAt.map(_.toInstant)).version
     // never empty: the best artifact is at this version
     val atLatest = arts.filter(_.version == version)
     val targets = arts.toList.map(_.target).distinct.sorted
@@ -283,13 +287,32 @@ final class Freshness(depsDev: DepsDev, repo: IngestRepo, maxPackages: Int)(
   def run: IO[String] =
     repo.activePackages(maxPackages).flatMap { pkgs =>
       pkgs.flatTraverse(updates).flatMap { found =>
-        repo
-          .advance(found)
-          .as(
-            s"checked ${pkgs.size} active packages, ${found.size} artifacts have newer versions"
-          )
+        repo.advance(found) *> recheck(maxPackages - pkgs.size).map(r =>
+          s"checked ${pkgs.size} active packages, ${found.size} artifacts have newer versions$r"
+        )
       }
     }
+
+  /** Asks again for every artifact of up to `limit` packages marked for it,
+    * then regroups them, since their latest version may be chosen differently
+    * now.
+    */
+  private def recheck(limit: Int): IO[String] =
+    if limit <= 0 then IO.pure("")
+    else
+      repo.toRecheck(limit).flatMap {
+        case Nil  => IO.pure("")
+        case pkgs =>
+          val refs = pkgs.map(p => PackageRef(p.groupId, p.name))
+          for
+            found <- pkgs.flatTraverse(p =>
+              p.artifacts.toList.traverseFilter(newer(p.groupId, _))
+            )
+            _ <- repo.advance(found)
+            _ <- Enrich(depsDev, repo).rebuild(refs)
+            _ <- repo.rechecked(refs)
+          yield s"; rechecked ${pkgs.size} packages, ${found.size} artifacts changed"
+      }
 
   /** The representative's newer version, then those of the siblings that moved
     * too; nothing when the representative has not moved.
@@ -312,12 +335,19 @@ final class Freshness(depsDev: DepsDev, repo: IngestRepo, maxPackages: Int)(
   ): IO[Option[NewerVersion]] =
     depsDev
       .packageVersions(s"$groupId:${a.artifactId}")
-      .map(versions =>
+      .map { versions =>
+        def at(v: VersionEntry) =
+          v.publishedAt.flatMap(t => Try(Instant.parse(t)).toOption)
+        val currentAt = versions.find(_.version == a.version).flatMap(at)
         versions.toNel
-          .map(MavenVersions.best(_)(_.version).version)
-          .filter(MavenVersions.isBetter(_, a.version))
-          .map(NewerVersion(groupId, a.artifactId, a.version, _))
-      )
+          .map(MavenVersions.best(_)(_.version, at))
+          .filter(b =>
+            MavenVersions.isBetter(b.version, at(b), a.version, currentAt)
+          )
+          .map(b =>
+            NewerVersion(groupId, a.artifactId, a.version, b.version, at(b))
+          )
+      }
       .handleErrorWith(e =>
         log
           .warn(

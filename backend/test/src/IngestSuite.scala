@@ -29,6 +29,7 @@ import com.softinio.scalapkg.maven.MavenIndex
 
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
+import java.time.Instant
 import java.time.OffsetDateTime
 import java.util.zip.GZIPOutputStream
 
@@ -143,19 +144,48 @@ class IngestSuite extends munit.FunSuite {
   }
 
   test("stable versions win over pre-releases") {
-    assert(MavenVersions.isBetter("2.13.0", "2.12.0"))
-    assert(MavenVersions.isBetter("2.10.0", "2.9.0"))
-    assert(!MavenVersions.isBetter("3.0.0-RC1", "2.13.0"))
-    assert(MavenVersions.isBetter("2.13.0", "3.0.0-RC1"))
-    assert(MavenVersions.isBetter("3.0.0-RC2", "3.0.0-RC1"))
+    def better(a: String, b: String) = MavenVersions.isBetter(a, None, b, None)
+    def best(vs: String*) = MavenVersions.best(NonEmptyList.fromListUnsafe(vs.toList))(identity, _ => None)
+    assert(better("2.13.0", "2.12.0"))
+    assert(better("2.10.0", "2.9.0"))
+    assert(!better("3.0.0-RC1", "2.13.0"))
+    assert(better("2.13.0", "3.0.0-RC1"))
+    assert(better("3.0.0-RC2", "3.0.0-RC1"))
     assert(MavenVersions.isPreRelease("1.0.0-M3"))
     assert(MavenVersions.isPreRelease("0.4.0+12-abcdef12-SNAPSHOT"))
     assert(!MavenVersions.isPreRelease("1.0.0"))
-    assertEquals(
-      MavenVersions.best(NonEmptyList.of("1.0.0", "1.1.0-RC1", "1.0.1", "0.9.0"))(identity),
-      "1.0.1"
+    assertEquals(best("1.0.0", "1.1.0-RC1", "1.0.1", "0.9.0"), "1.0.1")
+    assertEquals(best("1.0.0-M1", "1.0.0-M2"), "1.0.0-M2")
+  }
+
+  test("builds named after a commit and SNAP builds are pre-releases") {
+    List(
+      "1.0-234-d1a2b53", // dynver (http4s)
+      "0.10.3-16-2cae72",
+      "2780582bcfd73c8888a7bfa198351e413b684459-0-278058", // Mill
+      "3.3.0.0-SNAP3" // scalatestplus
+    ).foreach(v => assert(MavenVersions.isPreRelease(v), v))
+    // all digits is a date, not a commit
+    List("20240101", "1.0.0", "0.23.33", "4.1.0-9.6.0", "1.0.0-scala3")
+      .foreach(v => assert(!MavenVersions.isPreRelease(v), v))
+  }
+
+  test("a lower version released over a year after a higher one replaces it") {
+    def at(d: String) = Some(Instant.parse(s"${d}T00:00:00Z"))
+    // kyo-core_3: a stray 3.0.7, two years before 0.19.0
+    assert(MavenVersions.isBetter("0.19.0", at("2025-05-12"), "3.0.7", at("2023-05-02")))
+    assert(!MavenVersions.isBetter("3.0.7", at("2023-05-02"), "0.19.0", at("2025-05-12")))
+    // a maintenance release of an older line within the year does not
+    assert(!MavenVersions.isBetter("10.1.15", at("2025-03-01"), "10.2.4", at("2024-06-01")))
+    // nor does one whose date is unknown
+    assert(!MavenVersions.isBetter("0.19.0", None, "3.0.7", at("2023-05-02")))
+    val versions = NonEmptyList.of(
+      "3.0.7" -> at("2023-05-02"),
+      "0.18.0" -> at("2025-01-10"),
+      "0.19.0" -> at("2025-05-12"),
+      "1.0.0-RC7" -> at("2026-09-29")
     )
-    assertEquals(MavenVersions.best(NonEmptyList.of("1.0.0-M1", "1.0.0-M2"))(identity), "1.0.0-M2")
+    assertEquals(MavenVersions.best(versions)(_._1, _._2)._1, "0.19.0")
   }
 
   test("artifacts are grouped into one package row") {

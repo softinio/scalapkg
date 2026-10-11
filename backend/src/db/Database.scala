@@ -74,7 +74,8 @@ object Database:
         List(
           dumbo.ResourceFilePath("/db/migration/V1__init.sql"),
           dumbo.ResourceFilePath("/db/migration/V2__search_events.sql"),
-          dumbo.ResourceFilePath("/db/migration/V3__project_moves.sql")
+          dumbo.ResourceFilePath("/db/migration/V3__project_moves.sql"),
+          dumbo.ResourceFilePath("/db/migration/V4__recheck_versions.sql")
         )
       )
       .withSession(sessions)(using cats.effect.Sync[IO], dumboConsoleLogger)
