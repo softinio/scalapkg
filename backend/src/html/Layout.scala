@@ -214,12 +214,19 @@ object Layout:
 
   private val footerHeading = cls := Styles.eyebrow
 
-  private def footerLink(url: String, label: String): Frag =
+  private def footerLink(url: String, content: Frag*): Frag =
     a(
       href := url,
-      cls := "inline-block py-1.5 text-slate-600 transition hover:text-brand dark:text-slate-300 dark:hover:text-brand-light",
-      label
+      cls := "inline-flex items-center gap-1.5 py-1.5 text-slate-600 transition hover:text-brand dark:text-slate-300 dark:hover:text-brand-light",
+      content
     )
+
+  // the usual feed icon, in the usual orange
+  private val feedIcon: Frag = raw(
+    """<svg class="h-4 w-4 text-orange-500" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">""" +
+      """<circle cx="6.18" cy="17.82" r="2.18"/>""" +
+      """<path d="M4 4.44v2.83c7.03 0 12.73 5.7 12.73 12.73h2.83c0-8.59-6.97-15.56-15.56-15.56zm0 5.66v2.83c3.9 0 7.07 3.17 7.07 7.07h2.83c0-5.47-4.43-9.9-9.9-9.9z"/></svg>"""
+  )
 
   private def footerFrag: Frag =
     footer(
@@ -249,7 +256,7 @@ object Layout:
             cls := "mt-1 space-y-0.5 text-sm",
             li(footerLink("/about#api", "JSON API")),
             li(footerLink("/about#mcp", "MCP server")),
-            li(footerLink("/feed.xml", "New releases feed"))
+            li(footerLink("/feed.xml", feedIcon, "New releases feed"))
           )
         ),
         div(
