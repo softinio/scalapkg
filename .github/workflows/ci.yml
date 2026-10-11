@@ -17,9 +17,10 @@ name: Continuous Integration
 on:
   pull_request:
     branches: ['**']
+  # not on tags: a release tags a commit CI already passed on main, and
+  # release.yml builds its jar
   push:
     branches: ['**']
-    tags: [v*]
 
 concurrency:
   group: ${{ github.workflow }} @ ${{ github.ref }}
