@@ -50,7 +50,7 @@ jobs:
         run: npm ci
 
       - name: Build assembly
-        run: ./mill --no-server backend.assembly
+        run: SCALAPKG_VERSION="${GITHUB_REF_NAME#v}" ./mill --no-server backend.assembly
 
       - name: Stage jar
         run: |
