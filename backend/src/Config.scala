@@ -21,6 +21,8 @@ import cats.syntax.all.*
 import ciris.*
 import com.comcast.ip4s.*
 
+import scala.concurrent.duration.*
+
 /** Where the server listens; `127.0.0.1` in production, behind nginx. */
 final case class HttpConfig(host: Host, port: Port)
 
@@ -67,6 +69,16 @@ final case class SearchConfig(
   */
 final case class SummaryConfig(apiKey: ciris.Secret[String], model: String)
 
+/** Package reports (`/status`): how often the reports job checks the queue and
+  * how many reports a run takes, and how many reports an hour are checked
+  * against deps.dev while the visitor waits.
+  */
+final case class ReportsConfig(
+    interval: FiniteDuration,
+    maxPerRun: Int,
+    livePerHour: Int
+)
+
 /** Every setting, read from `SCALAPKG_*` environment variables by `load`, all
   * optional. `baseUrl` is the public origin used in canonical URLs, the feed
   * and the MCP docs.
@@ -77,7 +89,8 @@ final case class AppConfig(
     baseUrl: String,
     devAssetsDir: Option[String],
     ingest: IngestConfig,
-    search: SearchConfig
+    search: SearchConfig,
+    reports: ReportsConfig
 )
 
 object AppConfig:
@@ -127,11 +140,18 @@ object AppConfig:
       ).parMapN((key, model) => key.map(SummaryConfig(_, model)))
     ).parMapN(SearchConfig.apply)
 
+    val reports = (
+      env("SCALAPKG_REPORTS_INTERVAL").as[FiniteDuration].default(6.hours),
+      env("SCALAPKG_REPORTS_MAX_PER_RUN").as[Int].default(200),
+      env("SCALAPKG_REPORTS_LIVE_PER_HOUR").as[Int].default(200)
+    ).parMapN(ReportsConfig.apply)
+
     (
       http,
       db,
       env("SCALAPKG_BASE_URL").default("http://localhost:8080"),
       env("SCALAPKG_DEV_ASSETS").option,
       ingest,
-      search
+      search,
+      reports
     ).parMapN(AppConfig.apply).load[IO]

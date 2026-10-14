@@ -20,6 +20,7 @@ import cats.data.NonEmptyList
 import cats.effect.IO
 import cats.effect.Ref
 import cats.syntax.all.*
+import com.softinio.scalapkg.db.*
 import com.softinio.scalapkg.db.EventSource
 import com.softinio.scalapkg.db.PackageRepo
 import com.softinio.scalapkg.db.SearchGate
@@ -125,11 +126,23 @@ class RoutesSuite extends CatsEffectSuite {
   private val live: ArtifactVersion => IO[LiveInfo] =
     _ => IO.pure(LiveInfo(None, Some(Nil), None))
 
-  private def app(limit: Int = 100, log: SearchLog = SearchLog.noop): IO[HttpApp[IO]] =
+  private val siteStatus = SiteStatus(
+    Some(IndexState(940, OffsetDateTime.parse("2026-10-03T04:00:00Z"), None, Some(941), Some(OffsetDateTime.parse("2026-10-02T04:00:00Z")))),
+    List(JobRun("enrich", None, None, Some(OffsetDateTime.parse("2026-10-03T05:00:00Z")), Some("enriched 3 artifacts"), None)),
+    Backlog(3, 0, 0, 10, 20),
+    ReportCounts(1, 2)
+  )
+
+  private def app(
+      limit: Int = 100,
+      log: SearchLog = SearchLog.noop,
+      submit: PackageReport => IO[ReportResult] = _ => IO.pure(ReportResult(ReportOutcome.Pending, "queued"))
+  ): IO[HttpApp[IO]] =
     for
       rl <- RateLimit(limit, 1.minute)
       el <- RateLimit(limit, 1.minute)
-    yield Main.httpApp(baseUrl, None, repo, live, rl, el, log)
+      reportLimit <- RateLimit(limit, 1.minute)
+    yield Main.httpApp(baseUrl, None, repo, live, rl, el, log, ReportsApi(IO.pure(siteStatus), submit, 6.hours, reportLimit))
 
   /** A SearchLog that keeps what it is given, in order. */
   private def recording: IO[(SearchLog, IO[List[(EventSource, SearchEvent)]])] =
@@ -484,5 +497,102 @@ class RoutesSuite extends CatsEffectSuite {
       assertEquals((search.total, search.results), (Some(1), List("github.com/typelevel/cats")))
       assertEquals((open.kind, open.result), (EventKind.Open, Some("org.typelevel:cats-core")))
       assertEquals((copy.kind, copy.detail), (EventKind.Copy, Some("sbt")))
+  }
+
+  private def report(a: HttpApp[IO], fields: (String, String)*): IO[(Status, String, Headers)] =
+    a.run(Request[IO](Method.POST, uri"/status/report").withEntity(UrlForm(fields*)))
+      .flatMap(r => r.as[String].map((r.status, _, r.headers)))
+
+  /** A submit that keeps what it is given. */
+  private def submitted: IO[(PackageReport => IO[ReportResult], IO[List[PackageReport]])] =
+    Ref[IO].of(Vector.empty[PackageReport]).map(ref =>
+      (
+        r => ref.update(_ :+ r).as(ReportResult(ReportOutcome.Added, "Added newlib_3 1.0.0.")),
+        ref.get.map(_.toList)
+      )
+    )
+
+  test("the status page shows the index, the jobs and the report form") {
+    get(uri"/status").map { (status, body, headers) =>
+      assertEquals(status, Status.Ok)
+      assert(body.contains("Index update 940"), body)
+      assert(body.contains("newer update waiting"), body)
+      assert(body.contains(">update 941</a>, published on"), body)
+      assert(body.contains("Package details"), body)
+      assert(body.contains("3 artifacts waiting"), body)
+      assert(body.contains("""action="/status/report""""), body)
+      // jobs that never ran here are left out
+      assert(!body.contains("Project summaries"), body)
+      assertEquals(headers.get(CIString("Cache-Control")).map(_.head.value), Some("public, max-age=60"))
+    }
+  }
+
+  test("the status is served as JSON") {
+    get(uri"/api/v1/status").map { (status, body, _) =>
+      assertEquals(status, Status.Ok)
+      val json = parse(body).getOrElse(fail(body))
+      assertEquals(json.hcursor.downField("index").get[Int]("lastChunk"), Right(940))
+      assertEquals(json.hcursor.downField("reports").get[Long]("pending"), Right(1L))
+    }
+  }
+
+  test("a report names an artifact when it has a Scala suffix, else a package") {
+    for
+      (submit, seen) <- submitted
+      a <- app(submit = submit)
+      (status, body, headers) <- report(a, "group" -> " io.newlib ", "artifact" -> "newlib_3", "reason" -> "missing", "note" -> "")
+      _ <- report(a, "group" -> "io.newlib", "artifact" -> "newlib", "reason" -> "version", "note" -> "stuck at 0.9")
+      reports <- seen
+    yield
+      assertEquals(status, Status.Ok)
+      assert(body.contains("Added newlib_3 1.0.0."), body)
+      assert(body.contains("/p/io.newlib/newlib"), body)
+      assertEquals(headers.get(CIString("Cache-Control")).map(_.head.value), Some("no-store"))
+      assertEquals(
+        reports,
+        List(
+          PackageReport("io.newlib", Some("newlib_3"), "newlib", ReportReason.Missing, None),
+          PackageReport("io.newlib", None, "newlib", ReportReason.Version, Some("stuck at 0.9"))
+        )
+      )
+  }
+
+  test("a malformed report gets the form back with the error, and is not checked") {
+    for
+      (submit, seen) <- submitted
+      a <- app(submit = submit)
+      (badGroup, body, _) <- report(a, "group" -> "../etc", "artifact" -> "newlib_3", "reason" -> "missing")
+      (badArtifact, _, _) <- report(a, "group" -> "io.newlib", "artifact" -> "a..b_3", "reason" -> "missing")
+      (badReason, _, _) <- report(a, "group" -> "io.newlib", "artifact" -> "newlib_3", "reason" -> "spam")
+      (longNote, _, _) <- report(a, "group" -> "io.newlib", "artifact" -> "newlib_3", "reason" -> "other", "note" -> "x" * 501)
+      reports <- seen
+    yield
+      assertEquals(List(badGroup, badArtifact, badReason, longNote), List.fill(4)(Status.BadRequest))
+      assert(body.contains("Enter a groupId"), body)
+      // the visitor's input is shown again
+      assert(body.contains("newlib_3"), body)
+      assertEquals(reports, Nil)
+  }
+
+  test("a report with the hidden field filled in is answered but not checked") {
+    for
+      (submit, seen) <- submitted
+      a <- app(submit = submit)
+      (status, _, _) <- report(a, "group" -> "io.newlib", "artifact" -> "newlib_3", "reason" -> "missing", "website" -> "http://spam")
+      reports <- seen
+    yield
+      assertEquals(status, Status.Ok)
+      assertEquals(reports, Nil)
+  }
+
+  test("reports over the limit get 429") {
+    app(limit = 1).flatMap { a =>
+      for
+        (r1, _, _) <- report(a, "group" -> "io.newlib", "artifact" -> "newlib_3", "reason" -> "missing")
+        (r2, _, _) <- report(a, "group" -> "io.newlib", "artifact" -> "newlib_3", "reason" -> "missing")
+      yield
+        assertEquals(r1, Status.Ok)
+        assertEquals(r2, Status.TooManyRequests)
+    }
   }
 }

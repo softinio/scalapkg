@@ -122,6 +122,10 @@ Every job that compares versions passes their release dates.
   its input text changes (digits ignored), at most monthly; with a GitHub token
   GitHub projects wait for their README first. About $10 per ten thousand
   projects at Haiku batch prices.
+- reports (6 h, `SCALAPKG_REPORTS_INTERVAL`): package reports from the
+  `/status` form that deps.dev could not answer when submitted; asks deps.dev
+  again, then Maven Central's plain repository (`maven/MavenRepo.scala`:
+  `maven-metadata.xml` and the group's directory listing, never `/.index/`).
 
 Optional jobs switch off when their key, token or model is missing.
 `SCALAPKG_INGEST_ENABLED=false` turns off the Maven/deps.dev jobs;
@@ -131,6 +135,20 @@ job must not blindly overwrite: Freshness records versions with a
 compare-and-set (`IngestRepo.advance`), and `saveDetails` inserts project rows
 before any artifact points at them. `IngestRepo` writes refresh the search
 documents they affect themselves; there is no separate reindex step.
+
+**Status and reports** (`db/StatusRepo.scala`, `ingest/Reports.scala`,
+migration V5): `Scheduler` records every job run in `job_runs` (V5
+backfilled it from earlier timestamps), and `IndexSync` notes when Central's
+index was last asked about and when its latest chunk was published. `/status`
+and `/api/v1/status` show them with the backlog counts. The form on `/status`
+(`POST /status/report`, 5/min per client, a honeypot field) takes a groupId
+and an artifactId or package name. `Reports.submit` asks deps.dev only, at
+most 2 at once and `SCALAPKG_REPORTS_LIVE_PER_HOUR` an hour for everyone,
+and adds or advances what it finds the way `IndexSync` and Freshness do,
+enriching it at once. Everything else is queued in `package_reports` for the
+reports job. A visitor's request never reaches Central, which limits our
+address for the index. Reports with a note that changed nothing are the
+review queue. Rows are deleted after 90 days.
 
 **Data model** (`backend/resources/db/migration/`): `artifacts` (one row per Maven
 artifactId) → `packages` (artifacts grouped by group + name across
@@ -244,6 +262,9 @@ Environment variables, all optional (`backend/src/Config.scala`):
 | `SCALAPKG_SEMANTIC_MAX_DISTANCE` | `0.35` | cosine distance cut-off for semantic matches |
 | `SCALAPKG_ANTHROPIC_API_KEY` | – | Anthropic API key for generated project summaries |
 | `SCALAPKG_SUMMARY_MODEL` | `claude-haiku-5-5` | model that writes the summaries |
+| `SCALAPKG_REPORTS_INTERVAL` | `6h` | how often the reports job checks queued reports |
+| `SCALAPKG_REPORTS_MAX_PER_RUN` | `200` | queued reports checked per run |
+| `SCALAPKG_REPORTS_LIVE_PER_HOUR` | `200` | reports checked against deps.dev while the visitor waits, per hour for everyone |
 
 ## Releasing and deploying
 

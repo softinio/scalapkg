@@ -56,6 +56,7 @@ final class IndexSync(
   def run: IO[String] =
     for
       remote <- maven.remoteCursor
+      _ <- repo.noteRemote(remote)
       local <- repo.cursor
       msg <- local match
         case Some(c)
@@ -207,18 +208,28 @@ final class Enrich(depsDev: DepsDev, repo: IngestRepo)(using log: Logger[IO]):
 
   private def round(pending: List[PendingArtifact]): IO[Int] =
     for
+      (found, missing) <- details(pending)
+      _ <- refreshProjects
+      _ <- log.info(
+        s"enrich: $found artifacts updated, $missing not on deps.dev yet"
+      )
+    yield pending.size
+
+  /** Looks up these artifacts on deps.dev, stores what it knows (new projects
+    * get a row without stats until `refreshProjects`), leaves the rest for a
+    * day, and regroups their packages. Returns how many were found and how many
+    * were not.
+    */
+  def details(pending: List[PendingArtifact]): IO[(Int, Int)] =
+    for
       found <- depsDev.versions(pending)(p =>
         ArtifactVersion(p.groupId, p.artifactId, p.version)
       )
       missing = pending.filterNot(found.map(_._1).toSet)
       _ <- repo.saveDetails(found)
       _ <- repo.defer(missing.map(p => ArtifactKey(p.groupId, p.artifactId)))
-      _ <- refreshProjects
       _ <- rebuild(pending.map(p => PackageRef(p.groupId, p.name)).distinct)
-      _ <- log.info(
-        s"enrich: ${found.size} artifacts updated, ${missing.size} not on deps.dev yet"
-      )
-    yield pending.size
+    yield (found.size, missing.size)
 
   /** Fetches stats for projects that are new or older than a week. Projects
     * deps.dev does not know are stored without stats until the next refresh.
@@ -528,12 +539,14 @@ object Drain:
       .compile
       .foldMonoid
 
-/** Runs the jobs on fixed delays inside the server process. */
-object Scheduler:
+/** Runs the jobs on fixed delays inside the server process, recording each run
+  * in `runs` for the status page.
+  */
+final class Scheduler(runs: JobRuns)(using log: Logger[IO]):
 
   /** Runs `job` after `initialDelay`, then again `interval` after each run
     * ends, forever. The line `job` returns is logged; a failure is logged and
-    * the next run still happens.
+    * the next run still happens. A failure to record a run is only logged.
     */
   def every(
       name: String,
@@ -541,15 +554,32 @@ object Scheduler:
       interval: FiniteDuration
   )(
       job: IO[String]
-  )(using log: Logger[IO]): IO[Nothing] =
+  ): IO[Nothing] =
+    def note(io: IO[Unit]): IO[Unit] =
+      io.handleErrorWith(e =>
+        log.warn(s"$name: run not recorded: ${e.getMessage}")
+      )
     val once =
-      log.info(s"$name: starting") *>
+      log.info(s"$name: starting") *> note(runs.started(name)) *>
         job.timed
-          .flatMap((took, msg) => log.info(s"$name: $msg (${took.toSeconds}s)"))
+          .flatMap((took, msg) =>
+            log.info(s"$name: $msg (${took.toSeconds}s)") *>
+              note(runs.finished(name, Right(msg)))
+          )
           .handleErrorWith {
             // an expected, self-explanatory condition: no stack trace
             case e: com.softinio.scalapkg.maven.IndexRateLimited =>
-              log.warn(s"$name: skipped, ${e.getMessage}")
-            case e => log.error(e)(s"$name: failed")
+              log.warn(s"$name: skipped, ${e.getMessage}") *>
+                note(runs.finished(name, Left(s"skipped, ${e.getMessage}")))
+            case e =>
+              log.error(e)(s"$name: failed") *>
+                note(
+                  runs.finished(
+                    name,
+                    Left(
+                      Option(e.getMessage).getOrElse(e.getClass.getSimpleName)
+                    )
+                  )
+                )
           }
     IO.sleep(initialDelay) *> (once *> IO.sleep(interval)).foreverM
