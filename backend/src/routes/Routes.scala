@@ -89,8 +89,8 @@ object Html:
     resp.map(_.putHeaders(cacheControl(seconds)))
 
 /** The HTML site: home and search (`/`), the results fragment the search island
-  * swaps in, `/p/{groupId}/{name}` deep links, `/about`, the Atom feed and
-  * `robots.txt`. Not rate-limited.
+  * swaps in, `/p/{groupId}/{name}` deep links, `/new`, `/about`, the Atom feed
+  * and `robots.txt`. Not rate-limited.
   */
 final class PublicRoutes(repo: PackageRepo, baseUrl: String):
 
@@ -135,6 +135,14 @@ final class PublicRoutes(repo: PackageRepo, baseUrl: String):
             )
           )
         case None => Html.notFound(Pages.notFound(baseUrl))
+      }
+
+    case req @ GET -> Root / "new" =>
+      val page = req.params.get("page").flatMap(_.toIntOption).getOrElse(1)
+      repo.newProjects(PackageRepo.maxNewProjects).flatMap { ps =>
+        if page < 1 || page > math.max(1, Pages.pageCount(ps.size)) then
+          Html.notFound(Pages.notFound(baseUrl))
+        else Html.cached(600)(Html.ok(Pages.newProjects(ps, page, baseUrl)))
       }
 
     case GET -> Root / "about" =>

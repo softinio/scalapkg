@@ -67,6 +67,9 @@ object PackageRepo:
   /** How recent a project's first release must be for it to count as new. */
   val newProjectDays = 90
 
+  /** At most this many are listed on `/new`. */
+  val maxNewProjects = 500
+
   /** Search text beyond this many characters is dropped. */
   val maxQueryLength = 200
 
