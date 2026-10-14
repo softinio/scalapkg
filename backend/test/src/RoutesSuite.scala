@@ -117,7 +117,12 @@ class RoutesSuite extends CatsEffectSuite {
     def newest(limit: Int): IO[List[PackageSummary]] = IO.pure(all.take(limit))
     def mostStarred(limit: Int): IO[List[PackageSummary]] = IO.pure(List(cats))
     def newProjects(limit: Int): IO[List[NewProject]] =
-      IO.pure(List(NewProject(plugin, "2026-09-01T00:00:00Z")))
+      // sbt-scalafmt, then enough older ones for a second page of /new
+      IO.pure(
+        (NewProject(plugin, "2026-09-01T00:00:00Z") ::
+          List.tabulate(24)(i => NewProject(plugin.copy(name = s"older-$i"), "2026-08-01T00:00:00Z")))
+          .take(limit)
+      )
     def releases(since: OffsetDateTime, limit: Int): IO[List[Release]] =
       IO.pure(
         List(Release("org.typelevel", "cats-core", "2.13.0", "2025-01-20T10:00:00Z", cats.targets, cats.project))
@@ -196,6 +201,35 @@ class RoutesSuite extends CatsEffectSuite {
       assert(body.contains("data-island=\"search\""))
       assert(body.contains("data-island=\"package-drawer\""))
     }
+  }
+
+  test("every new project is listed on /new, linked from the landing page") {
+    for
+      (_, home, _) <- get(uri"/")
+      (status, body, headers) <- get(uri"/new")
+    yield
+      assert(home.contains("href=\"/new\""), home)
+      assertEquals(status, Status.Ok)
+      assert(body.contains("<h1"), body)
+      assert(body.contains("href=\"/p/org.scalameta/sbt-scalafmt\""), body)
+      assert(body.contains("Sep 1, 2026"), body)
+      assert(body.contains("Page 1 of 2"), body)
+      assert(body.contains("href=\"/new?page=2\""), body)
+      assertEquals(headers.get(CIString("Cache-Control")).map(_.head.value), Some("public, max-age=600"))
+  }
+
+  test("/new pages through the new projects 20 at a time") {
+    for
+      (status, body, _) <- get(uri"/new?page=2")
+      (past, _, _) <- get(uri"/new?page=3")
+      (zero, _, _) <- get(uri"/new?page=0")
+    yield
+      assertEquals(status, Status.Ok)
+      assert(body.contains("Page 2 of 2"), body)
+      assert(body.contains("older-23"), body)
+      assert(!body.contains("sbt-scalafmt"), body)
+      assert(body.contains("href=\"/new\""), body)
+      assertEquals((past, zero), (Status.NotFound, Status.NotFound))
   }
 
   test("pages load GoatCounter, settings before count.js") {

@@ -183,24 +183,12 @@ object Pages:
     div(
       cls := "grid gap-10 lg:grid-cols-3",
       section(
-        h2(cls := Styles.sectionHeading, "New projects"),
-        if lists.newProjects.isEmpty then
-          p(
-            cls := "mt-4 text-sm text-slate-500",
-            s"No Scala project first released in the last ${PackageRepo.newProjectDays} days yet."
-          )
-        else
-          compactList(
-            lists.newProjects.map(n =>
-              n.pkg -> Some(
-                div(
-                  cls := "font-mono text-xs text-slate-500",
-                  title := "First released",
-                  Dates.short(n.firstReleaseAt)
-                )
-              )
-            )
-          )
+        div(
+          cls := "flex items-baseline justify-between",
+          h2(cls := Styles.sectionHeading, "New projects"),
+          a(href := "/new", cls := s"text-sm ${Styles.link}", "All new →")
+        ),
+        newProjectList(lists.newProjects)
       ),
       section(
         div(
@@ -237,6 +225,61 @@ object Pages:
               .map(s => div(cls := Styles.stat, s"★ ${formatCount(s)}"))
           )
         )
+      )
+    )
+
+  private def newProjectList(projects: List[NewProject]): Frag =
+    if projects.isEmpty then
+      p(
+        cls := "mt-4 text-sm text-slate-500",
+        s"No Scala project first released in the last ${PackageRepo.newProjectDays} days yet."
+      )
+    else
+      compactList(
+        projects.map(n =>
+          n.pkg -> Some(
+            div(
+              cls := "font-mono text-xs text-slate-500",
+              title := "First released",
+              Dates.short(n.firstReleaseAt)
+            )
+          )
+        )
+      )
+
+  /** `/new`: every project first released within `newProjectDays`, a page of
+    * `SearchQuery.pageSize` at a time.
+    */
+  def newProjects(
+      projects: List[NewProject],
+      page: Int,
+      baseUrl: String
+  ): String =
+    def hrefFor(n: Int) = if n == 1 then "/new" else s"/new?page=$n"
+    val pages = pageCount(projects.size)
+    val shown = projects
+      .drop((page - 1) * SearchQuery.pageSize)
+      .take(SearchQuery.pageSize)
+    Layout.page(
+      PageMeta(
+        if page == 1 then "New projects" else s"New projects, page $page",
+        s"Scala projects first released on Maven Central in the last ${PackageRepo.newProjectDays} days.",
+        hrefFor(page)
+      ),
+      baseUrl
+    )(
+      div(
+        cls := "mx-auto max-w-3xl px-4 py-12 sm:px-6",
+        h1(
+          cls := "font-display text-3xl font-bold tracking-tight text-slate-900 dark:text-white",
+          "New projects"
+        ),
+        p_(
+          cls := Styles.bodyText,
+          s"Scala projects first released on Maven Central in the last ${PackageRepo.newProjectDays} days, newest first. Projects that only moved to new Maven coordinates are left out."
+        ),
+        newProjectList(shown),
+        pageLinks(page, pages, hrefFor, swap = false)
       )
     )
 
@@ -529,35 +572,43 @@ object Pages:
 
   private def pager(r: SearchResponse): Frag =
     val q = r.query
-    val pages = math.min(
-      SearchQuery.maxPage,
-      (r.total + SearchQuery.pageSize - 1) / SearchQuery.pageSize
+    pageLinks(
+      q.page,
+      math.min(SearchQuery.maxPage, pageCount(r.total)),
+      n => searchHref(q.copy(page = n)),
+      swap = true
     )
+
+  def pageCount(total: Int): Int =
+    (total + SearchQuery.pageSize - 1) / SearchQuery.pageSize
+
+  /** Previous / "Page n of m" / Next; with `swap` the search island swaps the
+    * linked page in.
+    */
+  private def pageLinks(
+      page: Int,
+      pages: Int,
+      hrefFor: Int => String,
+      swap: Boolean
+  ): Frag =
+    def link(n: Int, label: String) =
+      a(
+        href := hrefFor(n),
+        if swap then attr("data-swap").empty else frag(),
+        cls := Styles.secondaryButton,
+        label
+      )
     if pages <= 1 then frag()
     else
       tag("nav")(
         aria.label := "Pagination",
         cls := "mt-8 flex items-center justify-between",
-        if q.page > 1 then
-          a(
-            href := searchHref(q.copy(page = q.page - 1)),
-            attr("data-swap").empty,
-            cls := Styles.secondaryButton,
-            "← Previous"
-          )
-        else span(),
+        if page > 1 then link(page - 1, "← Previous") else span(),
         span(
           cls := "font-mono text-sm text-slate-500",
-          s"Page ${q.page} of $pages"
+          s"Page $page of $pages"
         ),
-        if q.page < pages then
-          a(
-            href := searchHref(q.copy(page = q.page + 1)),
-            attr("data-swap").empty,
-            cls := Styles.secondaryButton,
-            "Next →"
-          )
-        else span()
+        if page < pages then link(page + 1, "Next →") else span()
       )
 
   /** Stored summary, shown inside <noscript> on /p/... deep links. */
