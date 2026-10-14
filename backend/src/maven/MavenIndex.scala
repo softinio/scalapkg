@@ -40,6 +40,8 @@ import scodec.codecs.*
 
 import java.io.StringReader
 import java.time.Instant
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import java.util.Properties
 
 /** A `u` (added) entry of the Maven Central nexus index. `publishedAt` is the
@@ -155,10 +157,17 @@ object MavenIndex:
       Option(props.getProperty(s"nexus.index.$key"))
         .flatMap(read)
         .toRight(s"missing nexus.index.$key")
+    // when the latest chunk was published, e.g. `20261002043023.811 +0000`
+    val published = prop("timestamp")(s =>
+      scala.util.Try(ZonedDateTime.parse(s.trim, timestampFormat)).toOption
+    ).toOption.map(_.toInstant)
     for
       chainId <- prop("chain-id")(Some(_).filter(_.nonEmpty))
       last <- prop("last-incremental")(_.toIntOption)
-    yield IndexCursor(chainId, last)
+    yield IndexCursor(chainId, last, published)
+
+  private val timestampFormat =
+    DateTimeFormatter.ofPattern("yyyyMMddHHmmss.SSS Z")
 
   /** Decodes a gzipped index (incremental chunk or full index) as it streams
     * in. Only `u` (added) records come out; `del` (removed), descriptor and

@@ -272,6 +272,13 @@ object Layout:
               "Maven Central"
             ),
             " index."
+          ),
+          p(
+            cls := "mt-2 text-sm text-slate-600 dark:text-slate-400",
+            a(href := "/status", cls := Styles.link, "Index status"),
+            " shows when it was last updated. Library missing? ",
+            a(href := "/status#report", cls := Styles.link, "Report it"),
+            "."
           )
         )
       ),

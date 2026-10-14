@@ -23,10 +23,16 @@ import cats.effect.Ref
 import cats.syntax.all.*
 import com.softinio.scalapkg.db.EventSource
 import com.softinio.scalapkg.db.PackageRepo
+import com.softinio.scalapkg.db.PackageReport
+import com.softinio.scalapkg.db.ReportOutcome
+import com.softinio.scalapkg.db.ReportReason
+import com.softinio.scalapkg.db.ReportResult
 import com.softinio.scalapkg.db.SearchLog
+import com.softinio.scalapkg.db.SiteStatus
 import com.softinio.scalapkg.domain.*
 import com.softinio.scalapkg.html.Feed
 import com.softinio.scalapkg.html.Pages
+import com.softinio.scalapkg.html.ReportForm
 import io.circe.parser.decode
 import io.circe.syntax.*
 import org.http4s.*
@@ -60,6 +66,12 @@ object Html:
 
   def notFound(body: String): IO[Response[IO]] =
     withType(Status.NotFound, body, MediaType.text.html)
+
+  def badRequest(body: String): IO[Response[IO]] =
+    withType(Status.BadRequest, body, MediaType.text.html)
+
+  /** For answers to one visitor's form, which no cache may keep. */
+  val noStore: Header.Raw = Header.Raw(CIString("Cache-Control"), "no-store")
 
   def atom(body: String): IO[Response[IO]] =
     withType(Status.Ok, body, MediaType.application.`atom+xml`)
@@ -262,6 +274,134 @@ object EventRoutes:
         e.results.size <= SearchEvent.maxResults &&
         (e.results ++ e.result ++ e.detail).forall(_.length <= maxText)
     )(e.copy(query = query))
+
+/** `/status`, the state of the index and its jobs, and the same as JSON at
+  * `/api/v1/status` (mounted under the rate-limited `/api`).
+  */
+final class StatusRoutes(
+    status: IO[SiteStatus],
+    reportsInterval: FiniteDuration,
+    baseUrl: String
+):
+
+  private val cors = Header.Raw(CIString("Access-Control-Allow-Origin"), "*")
+
+  val page: HttpRoutes[IO] = HttpRoutes.of[IO] { case GET -> Root / "status" =>
+    Html.cached(60)(
+      (status, IO.realTimeInstant).flatMapN((s, now) =>
+        Html.ok(
+          Pages.status(s, now, ReportForm.empty, None, reportsInterval, baseUrl)
+        )
+      )
+    )
+  }
+
+  val api: HttpRoutes[IO] = HttpRoutes.of[IO] {
+    case GET -> Root / "v1" / "status" =>
+      status.flatMap(s =>
+        Ok(s.asJson).map(_.putHeaders(cors, Html.cacheControl(60)))
+      )
+  }
+
+/** `POST /status/report`: the report form on `/status` (works without JS). The
+  * body is read only up to `ReportRoutes.maxBody` bytes. A bad form gets the
+  * status page again with the error (400); a good one the outcome of `submit`.
+  * A filled-in honeypot field gets a plausible answer and nothing else.
+  */
+final class ReportRoutes(
+    submit: PackageReport => IO[ReportResult],
+    status: IO[SiteStatus],
+    reportsInterval: FiniteDuration,
+    baseUrl: String
+):
+
+  val routes: HttpRoutes[IO] = HttpRoutes.of[IO] { case req @ POST -> Root =>
+    req.body
+      .take(ReportRoutes.maxBody + 1L)
+      .compile
+      .to(Array)
+      .flatMap { bytes =>
+        val fields = Option
+          .when(bytes.length <= ReportRoutes.maxBody)(bytes)
+          .flatMap(b =>
+            UrlForm.decodeString(Charset.`UTF-8`)(String(b, UTF_8)).toOption
+          )
+          .map(_.values.view.mapValues(_.headOption.getOrElse("")).toMap)
+          .getOrElse(Map.empty)
+        val form = ReportForm(
+          fields.getOrElse("group", ""),
+          fields.getOrElse("artifact", ""),
+          fields.getOrElse("reason", ReportReason.Missing.param),
+          fields.getOrElse("note", "")
+        )
+        ReportRoutes.parse(form) match
+          case Left(error) =>
+            (status, IO.realTimeInstant)
+              .flatMapN((s, now) =>
+                Html.badRequest(
+                  Pages
+                    .status(s, now, form, Some(error), reportsInterval, baseUrl)
+                )
+              )
+              .map(_.putHeaders(Html.noStore))
+          case Right(report) =>
+            val result =
+              if fields.get("website").exists(_.nonEmpty) then
+                IO.pure(
+                  ReportResult(ReportOutcome.Pending, "Thanks, it is queued.")
+                )
+              else submit(report)
+            result
+              .flatMap(r => Html.ok(Pages.reportResult(report, r, baseUrl)))
+              .map(_.putHeaders(Html.noStore))
+      }
+  }
+
+object ReportRoutes:
+  val maxBody = 4096
+  val maxNote = 500
+  private val maxId = 100
+
+  private val groupId = "[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*".r
+  private val artifactId = "[A-Za-z0-9][A-Za-z0-9_.-]*".r
+
+  /** The report the form describes, or what is wrong with it. An artifact with
+    * a Scala suffix (`zio-http_3`) is reported as that artifact, anything else
+    * as a package name (`zio-http`).
+    */
+  def parse(form: ReportForm): Either[String, PackageReport] =
+    val group = form.group.trim
+    val artifact = form.artifact.trim
+    val note = form.note.trim
+    for
+      _ <- Either.cond(
+        group.length <= maxId && groupId.matches(group),
+        (),
+        "Enter a groupId such as dev.zio."
+      )
+      _ <- Either.cond(
+        artifact.length <= maxId && artifactId.matches(artifact) &&
+          !artifact.contains(".."),
+        (),
+        "Enter an artifactId such as zio-http_3, or a package name such as zio-http."
+      )
+      reason <- ReportReason
+        .parse(form.reason)
+        .toRight("Choose what is wrong.")
+      _ <- Either.cond(
+        note.length <= maxNote,
+        (),
+        s"Keep the note under $maxNote characters."
+      )
+    yield
+      val parsed = ArtifactIds.parse(artifact)
+      PackageReport(
+        group,
+        parsed.as(artifact),
+        parsed.fold(artifact)(_.name),
+        reason,
+        Option(note).filter(_.nonEmpty)
+      )
 
 /** Fixed-window per-client request limit for the API and MCP endpoints. The
   * client is the X-Real-IP address (nginx overwrites it) or the peer, never

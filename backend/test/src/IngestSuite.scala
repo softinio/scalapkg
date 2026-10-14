@@ -26,6 +26,11 @@ import com.softinio.scalapkg.domain.Target
 import com.softinio.scalapkg.ingest.Enrich
 import com.softinio.scalapkg.maven.IndexRecord
 import com.softinio.scalapkg.maven.MavenIndex
+import com.softinio.scalapkg.maven.MavenRepo
+import com.softinio.scalapkg.db.PackageReport
+import com.softinio.scalapkg.db.ReportReason
+import com.softinio.scalapkg.domain.ArtifactIds
+import com.softinio.scalapkg.ingest.Reports
 
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
@@ -215,5 +220,49 @@ class IngestSuite extends munit.FunSuite {
     assertEquals(PackageRepo.tsQuery("cats-effect"), Some("cats:* & effect:*"))
     assertEquals(PackageRepo.tsQuery("a'b & c | !d"), Some("a:* & b:* & c:* & d:*"))
     assertEquals(PackageRepo.tsQuery("  !!  "), None)
+  }
+
+  test("cursor properties carry the latest chunk's publish time") {
+    val c = MavenIndex.parseCursor(
+      "nexus.index.chain-id=1318453614498\nnexus.index.last-incremental=939\nnexus.index.timestamp=20261002043023.811 +0000\n"
+    )
+    assertEquals(c.map(_.publishedAt), Right(Some(Instant.parse("2026-10-02T04:30:23.811Z"))))
+  }
+
+  test("maven-metadata.xml versions are read") {
+    val xml =
+      """<?xml version="1.0" encoding="UTF-8"?>
+        |<metadata>
+        |  <groupId>dev.zio</groupId>
+        |  <artifactId>zio-http_3</artifactId>
+        |  <versioning>
+        |    <latest>3.1.0</latest>
+        |    <release>3.1.0</release>
+        |    <versions>
+        |      <version>3.0.0</version>
+        |      <version> 3.1.0 </version>
+        |    </versions>
+        |    <lastUpdated>20260930120000</lastUpdated>
+        |  </versioning>
+        |</metadata>""".stripMargin
+    assertEquals(MavenRepo.versions(xml), List("3.0.0", "3.1.0"))
+    assertEquals(MavenRepo.versions("<metadata/>"), Nil)
+  }
+
+  test("a repository directory listing gives its subdirectories") {
+    val html =
+      """<a href="../">../</a>
+        |<a href="zio-http_3/" title="zio-http_3/">zio-http_3/</a>    2026-09-30 12:00 -
+        |<a href="zio-http_sjs1_3/" title="zio-http_sjs1_3/">zio-http_sjs1_3/</a>
+        |<a href="maven-metadata.xml" title="maven-metadata.xml">maven-metadata.xml</a>""".stripMargin
+    assertEquals(MavenRepo.listing(html), List("zio-http_3", "zio-http_sjs1_3"))
+  }
+
+  test("a package name is tried with the common Scala suffixes, an artifactId as it is") {
+    val byName = PackageReport("dev.zio", None, "zio-http", ReportReason.Missing, None)
+    val byId = byName.copy(artifactId = Some("zio-http_sjs1_2.13"))
+    assert(Reports.candidates(byName).contains("zio-http_3"))
+    assert(Reports.candidates(byName).forall(a => ArtifactIds.parse(a).exists(_.name == "zio-http")), Reports.candidates(byName))
+    assertEquals(Reports.candidates(byId), List("zio-http_sjs1_2.13"))
   }
 }

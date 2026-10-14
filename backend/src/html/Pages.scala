@@ -16,8 +16,9 @@
 
 package com.softinio.scalapkg.html
 
-import com.softinio.scalapkg.db.PackageRepo
+import com.softinio.scalapkg.db.*
 import com.softinio.scalapkg.domain.*
+import com.softinio.scalapkg.ingest.Reports
 import com.softinio.scalapkg.style.Styles
 import io.circe.syntax.*
 import scalatags.Text.all.*
@@ -26,11 +27,30 @@ import scalatags.Text.tags2.section
 
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.time.Instant
+import java.time.OffsetDateTime
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+import scala.concurrent.duration.FiniteDuration
 
 /** Server-rendered HTML for `PublicRoutes`: the home page (landing lists,
   * search results or a `/p/...` deep link), the search results fragment the
   * search island swaps in, and the about and 404 pages.
   */
+/** What a visitor typed into the report form on `/status`, kept to show it
+  * again when it is refused.
+  */
+final case class ReportForm(
+    group: String,
+    artifact: String,
+    reason: String,
+    note: String
+)
+
+object ReportForm:
+  val empty: ReportForm = ReportForm("", "", ReportReason.Missing.param, "")
+
 object Pages:
 
   private def enc(s: String) = URLEncoder.encode(s, StandardCharsets.UTF_8)
@@ -589,6 +609,16 @@ object Pages:
             " or ",
             code("_sjs1_3"),
             ". All targets of one library are grouped into one package, and search shows one result per project with its matching packages."
+          ),
+          p_(
+            cls := Styles.bodyText,
+            "See also ",
+            a(
+              href := "https://index.scala-lang.org",
+              cls := Styles.link,
+              "Scaladex"
+            ),
+            ", the Scala Center's official index of Scala libraries."
           )
         ),
         section(
@@ -639,6 +669,10 @@ object Pages:
             "GET /api/v1/new-projects?limit=20",
             s"Projects first released in the last ${PackageRepo.newProjectDays} days, newest first, with their first release date."
           ),
+          endpoint(
+            "GET /api/v1/status",
+            "When the index and each background job last ran, and what they still have to do."
+          ),
           endpoint("GET /feed.xml", "Atom feed of new releases.")
         ),
         section(
@@ -661,6 +695,417 @@ object Pages:
           p_(
             cls := Styles.bodyText,
             "To improve search results, the site records the searches made on it and through the MCP server, and which results were opened, followed or had an install snippet copied, with their position in the list. Nothing identifies you: no IP address, cookie or browser details are kept, only a random id per browser tab so that rephrased searches can be told apart. Records are deleted after 90 days. Page views are counted with GoatCounter, which does not track visitors either."
+          ),
+          p_(
+            cls := Styles.bodyText,
+            "Packages reported on the status page are kept with their note, but nothing about who reported them, and are deleted after 90 days."
+          )
+        )
+      )
+    )
+
+  // ----------------------------------------------------------------- status
+
+  private val dayFormat =
+    DateTimeFormatter.ofPattern("MMM d, yyyy", Locale.ENGLISH)
+
+  private def day(t: OffsetDateTime): String =
+    t.atZoneSameInstant(ZoneOffset.UTC).format(dayFormat)
+
+  /** "5 min ago", "3 h ago", "4 days ago". */
+  def ago(t: OffsetDateTime, now: Instant): String =
+    val d = java.time.Duration.between(t.toInstant, now)
+    val minutes = d.toMinutes
+    if minutes < 1 then "just now"
+    else if minutes < 60 then s"$minutes min ago"
+    else if minutes < 48 * 60 then s"${minutes / 60} h ago"
+    else s"${d.toDays} days ago"
+
+  // the jobs the page shows, in order, with what each one does; jobs not
+  // set up on this server have no row in job_runs and are left out
+  private val jobInfo: List[(String, String, String)] = List(
+    (
+      "index-sync",
+      "Maven Central index",
+      "Reads the index updates Central publishes about every two weeks; checked daily."
+    ),
+    (
+      "freshness",
+      "New versions",
+      "Asks deps.dev daily for newer versions of packages released in the last year."
+    ),
+    (
+      "enrich",
+      "Package details",
+      "Release dates, licences and source repositories from deps.dev, every 15 minutes."
+    ),
+    (
+      "first-releases",
+      "First release dates",
+      "Dates artifacts the index gave no publish time for, from deps.dev."
+    ),
+    ("deps", "Dependencies", "Who depends on what, from deps.dev, hourly."),
+    (
+      "github",
+      "GitHub",
+      "Topics, READMEs and creation dates, weekly per repository."
+    ),
+    (
+      "embed",
+      "Semantic search",
+      "Embeddings for search documents whose text changed."
+    ),
+    (
+      "summaries",
+      "Project summaries",
+      "One-line summaries and keywords written by Claude."
+    ),
+    (
+      "reports",
+      "Package reports",
+      "Checks queued reports against deps.dev and Maven Central."
+    )
+  )
+
+  private def backlog(job: String, s: SiteStatus): Option[String] =
+    val b = s.backlog
+    job match
+      case "enrich" if b.enrichPending > 0 =>
+        Some(s"${b.enrichPending} artifacts waiting")
+      case "deps" if b.depsWaiting > 0 =>
+        Some(s"${b.depsWaiting} packages waiting")
+      case "embed" if b.unembedded > 0 =>
+        Some(s"${b.unembedded} documents waiting")
+      case "summaries" => Some(s"${b.summarised} of ${b.projects} projects")
+      case "reports" if s.reports.pending > 0 =>
+        Some(s"${s.reports.pending} reports queued")
+      case _ => None
+
+  private def jobRow(
+      run: JobRun,
+      label: String,
+      desc: String,
+      s: SiteStatus,
+      now: Instant
+  ): Frag =
+    val running =
+      run.startedAt.exists(st => run.finishedAt.forall(_.isBefore(st)))
+    val failed = run.error.isDefined &&
+      run.finishedAt.exists(f => run.okAt.forall(_.isBefore(f)))
+    li(
+      cls := "flex flex-col gap-1 py-4 sm:flex-row sm:items-start sm:justify-between sm:gap-6",
+      div(
+        cls := "min-w-0",
+        p_(cls := "font-semibold text-slate-900 dark:text-white", label),
+        p_(cls := "mt-0.5 text-sm text-slate-600 dark:text-slate-400", desc),
+        if failed then
+          p_(
+            cls := "mt-1 break-words text-sm text-accent",
+            "Last run failed: ",
+            run.error.getOrElse("")
+          )
+        else frag()
+      ),
+      div(
+        cls := "flex shrink-0 flex-wrap items-center gap-2 sm:justify-end",
+        if running then span(cls := Styles.chip, "running")
+        else frag(),
+        backlog(run.job, s).map(span(cls := Styles.mutedChip, _)),
+        span(
+          cls := Styles.stat,
+          run.okAt.fold("no successful run yet")(t => s"ok ${ago(t, now)}")
+        )
+      )
+    )
+
+  // Central's directory of index files, each chunk with its date
+  private val centralIndex = "https://repo1.maven.org/maven2/.index/"
+
+  private def indexPanel(index: Option[IndexState], now: Instant): Frag =
+    div(
+      cls := s"mt-6 ${Styles.panel}",
+      index match
+        case None =>
+          p_(
+            cls := "text-slate-700 dark:text-slate-300",
+            "The Maven Central index has not been read yet."
+          )
+        case Some(i) =>
+          val nextUpdate = i.remotePublishedAt.map(_.plusDays(14))
+          frag(
+            div(
+              cls := "flex flex-wrap items-center gap-2",
+              p_(
+                cls := "font-semibold text-slate-900 dark:text-white",
+                s"Index update ${i.lastChunk} read ${ago(i.updatedAt, now)}"
+              ),
+              if i.caughtUp then span(cls := Styles.chip, "up to date")
+              else span(cls := Styles.warnChip, "newer update waiting")
+            ),
+            ul(
+              cls := "mt-3 space-y-1 text-sm text-slate-600 dark:text-slate-400",
+              i.remoteLastChunk.map(n =>
+                li(
+                  "Central's latest is ",
+                  a(
+                    href := centralIndex,
+                    cls := Styles.link,
+                    attr("rel") := "nofollow",
+                    s"update $n"
+                  ),
+                  i.remotePublishedAt.fold(".")(t =>
+                    s", published on ${day(t)}."
+                  )
+                )
+              ),
+              i.remoteCheckedAt.map(t =>
+                li(s"Central was last asked ${ago(t, now)}.")
+              ),
+              if !i.caughtUp then
+                li("The newer update is read at the next daily check.")
+              else frag(),
+              nextUpdate.map(t =>
+                li(
+                  if t.toInstant.isAfter(now) then
+                    s"The next update is expected around ${day(t)}."
+                  else "The next update is due any day now."
+                )
+              )
+            )
+          )
+    )
+
+  private val inputClass =
+    "mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-slate-900 focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand-light/40 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+
+  private val labelClass =
+    "block text-sm font-medium text-slate-700 dark:text-slate-300"
+
+  private def reportForm(form: ReportForm, error: Option[String]): Frag =
+    val reasons = List(
+      ReportReason.Missing -> "It is missing",
+      ReportReason.Version -> "Its latest version is out of date",
+      ReportReason.Other -> "Something else is wrong"
+    )
+    tag("form")(
+      attr("method") := "post",
+      attr("action") := "/status/report",
+      cls := s"mt-6 space-y-4 ${Styles.panel}",
+      error.map(e =>
+        p_(
+          cls := "rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 text-sm text-accent",
+          attr("role") := "alert",
+          e
+        )
+      ),
+      div(
+        cls := "grid gap-4 sm:grid-cols-2",
+        div(
+          label(cls := labelClass, attr("for") := "report-group", "groupId"),
+          input(
+            id := "report-group",
+            name := "group",
+            cls := inputClass,
+            attr("required").empty,
+            attr("maxlength") := "100",
+            attr("autocomplete") := "off",
+            attr("spellcheck") := "false",
+            placeholder := "dev.zio",
+            value := form.group
+          )
+        ),
+        div(
+          label(
+            cls := labelClass,
+            attr("for") := "report-artifact",
+            "artifactId or package name"
+          ),
+          input(
+            id := "report-artifact",
+            name := "artifact",
+            cls := inputClass,
+            attr("required").empty,
+            attr("maxlength") := "100",
+            attr("autocomplete") := "off",
+            attr("spellcheck") := "false",
+            placeholder := "zio-http_3 or zio-http",
+            value := form.artifact
+          )
+        )
+      ),
+      div(
+        label(
+          cls := labelClass,
+          attr("for") := "report-reason",
+          "What is wrong"
+        ),
+        select(
+          id := "report-reason",
+          name := "reason",
+          cls := inputClass,
+          reasons.map((r, text) =>
+            option(
+              value := r.param,
+              if form.reason == r.param then attr("selected").empty else frag(),
+              text
+            )
+          )
+        )
+      ),
+      div(
+        label(
+          cls := labelClass,
+          attr("for") := "report-note",
+          "Note (optional)"
+        ),
+        textarea(
+          id := "report-note",
+          name := "note",
+          cls := inputClass,
+          attr("rows") := "3",
+          attr("maxlength") := "500",
+          placeholder := "Anything that helps, such as what looks wrong.",
+          form.note
+        )
+      ),
+      // left empty by people; bots that fill every field are ignored
+      div(
+        cls := "hidden",
+        attr("aria-hidden") := "true",
+        input(
+          name := "website",
+          attr("tabindex") := "-1",
+          attr("autocomplete") := "off"
+        )
+      ),
+      div(
+        cls := "flex flex-wrap items-center gap-4",
+        button(
+          `type` := "submit",
+          cls := Styles.primaryButton,
+          "Check and report"
+        ),
+        p_(
+          cls := "text-sm text-slate-600 dark:text-slate-400",
+          "Nothing identifies you. Reports are deleted after 90 days."
+        )
+      )
+    )
+
+  /** `/status`: how fresh the index is, each job's last run, and the form to
+    * report a missing or outdated package (filled in again with `error` when a
+    * submission was refused).
+    */
+  def status(
+      s: SiteStatus,
+      now: Instant,
+      form: ReportForm,
+      error: Option[String],
+      reportsInterval: FiniteDuration,
+      baseUrl: String
+  ): String =
+    val runs = s.jobs.map(r => r.job -> r).toMap
+    Layout.page(
+      PageMeta(
+        "Status",
+        "How up to date the Scala Packages index is, and how to report a missing package.",
+        "/status"
+      ),
+      baseUrl
+    )(
+      div(
+        cls := "mx-auto max-w-3xl space-y-10 px-4 py-12 sm:px-6",
+        section(
+          h1(
+            cls := "font-display text-3xl font-bold tracking-tight text-slate-900 dark:text-white",
+            "Status"
+          ),
+          p_(
+            cls := Styles.bodyText,
+            "Which Scala libraries exist comes from the Maven Central index, which Central updates only about every two weeks. New versions of libraries already listed show up within a day through deps.dev, but a brand-new library waits for the next index update, unless you ",
+            a(href := "#report", cls := Styles.link, "report it below"),
+            "."
+          ),
+          indexPanel(s.index, now)
+        ),
+        section(
+          h2(cls := Styles.sectionHeading, "Background jobs"),
+          ul(
+            cls := "mt-4 divide-y divide-slate-200 dark:divide-slate-800",
+            jobInfo.flatMap((job, label, desc) =>
+              runs.get(job).map(jobRow(_, label, desc, s, now))
+            )
+          )
+        ),
+        section(
+          id := "report",
+          h2(cls := Styles.sectionHeading, "Report a package"),
+          p_(
+            cls := Styles.bodyText,
+            "Missing a library, or showing an old version? Enter its coordinates. They are checked against deps.dev straight away, and the package is added or updated if it is there. If deps.dev does not have it yet, it is checked against deps.dev and Maven Central again within ",
+            Reports.hours(reportsInterval),
+            "."
+          ),
+          reportForm(form, error),
+          if s.reports.resolved > 0 then
+            p_(
+              cls := "mt-3 text-sm text-slate-600 dark:text-slate-400",
+              s"${s.reports.resolved} reported packages were added or updated in the last 30 days."
+            )
+          else frag()
+        )
+      )
+    )
+
+  /** The answer to a submitted report. */
+  def reportResult(
+      r: PackageReport,
+      result: ReportResult,
+      baseUrl: String
+  ): String =
+    val (title, linked) = result.outcome match
+      case ReportOutcome.Added    => ("Added to the index", true)
+      case ReportOutcome.Updated  => ("Updated", true)
+      case ReportOutcome.NoChange => ("Already up to date", true)
+      case ReportOutcome.Pending  => ("Queued", false)
+      case ReportOutcome.NotFound => ("Not found", false)
+      case ReportOutcome.NotScala => ("Not a Scala artifact", false)
+    Layout.page(
+      PageMeta(
+        title,
+        "The outcome of a package report.",
+        "/status",
+        noindex = true
+      ),
+      baseUrl
+    )(
+      div(
+        cls := "mx-auto max-w-3xl px-4 py-16 sm:px-6",
+        p_(cls := Styles.eyebrow, r.coordinate),
+        h1(
+          cls := "mt-2 font-display text-3xl font-bold tracking-tight text-slate-900 dark:text-white",
+          title
+        ),
+        p_(cls := Styles.bodyText, result.detail),
+        if result.outcome == ReportOutcome.NoChange && r.note.isDefined then
+          p_(
+            cls := Styles.bodyText,
+            "Your note has been kept for the maintainer to look at."
+          )
+        else frag(),
+        div(
+          cls := "mt-8 flex flex-wrap gap-3",
+          if linked then
+            a(
+              href := PackageRef(r.groupId, r.name).path,
+              cls := Styles.primaryButton,
+              s"Open ${r.groupId}:${r.name}"
+            )
+          else frag(),
+          a(
+            href := "/status#report",
+            cls := Styles.secondaryButton,
+            "Report another"
           )
         )
       )

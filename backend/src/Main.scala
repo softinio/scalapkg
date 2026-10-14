@@ -20,12 +20,17 @@ import cats.data.Kleisli
 import cats.effect.IO
 import cats.effect.IOApp
 import cats.effect.Resource
+import cats.effect.std.Semaphore
 import cats.syntax.all.*
 import com.softinio.scalapkg.db.Database
 import com.softinio.scalapkg.db.IngestRepo
 import com.softinio.scalapkg.db.PackageRepo
+import com.softinio.scalapkg.db.PackageReport
+import com.softinio.scalapkg.db.ReportResult
 import com.softinio.scalapkg.db.SearchGate
 import com.softinio.scalapkg.db.SearchLog
+import com.softinio.scalapkg.db.SiteStatus
+import com.softinio.scalapkg.db.StatusRepo
 import com.softinio.scalapkg.depsdev.DepsDev
 import com.softinio.scalapkg.domain.ApiError
 import com.softinio.scalapkg.domain.ArtifactVersion
@@ -35,6 +40,7 @@ import com.softinio.scalapkg.github.GitHub
 import com.softinio.scalapkg.html.Pages
 import com.softinio.scalapkg.ingest.*
 import com.softinio.scalapkg.maven.MavenIndex
+import com.softinio.scalapkg.maven.MavenRepo
 import com.softinio.scalapkg.routes.*
 import com.softinio.scalapkg.summary.Anthropic
 import io.circe.syntax.*
@@ -60,6 +66,17 @@ import scala.concurrent.duration.*
   * search documents, starts the ingestion jobs that are configured and serves
   * HTTP.
   */
+/** What the status page and the report form need: the status query, the report
+  * check, how often queued reports are checked, and the per-visitor limit on
+  * reports.
+  */
+final case class ReportsApi(
+    status: IO[SiteStatus],
+    submit: PackageReport => IO[ReportResult],
+    interval: FiniteDuration,
+    limit: RateLimit
+)
+
 object Main extends IOApp.Simple:
 
   private given LoggerFactory[IO] = Slf4jFactory.create[IO]
@@ -70,11 +87,11 @@ object Main extends IOApp.Simple:
   val version: String =
     Option(getClass.getPackage.getImplementationVersion).getOrElse("dev")
 
-  /** All routes: assets, then `/api` and `/mcp` behind `rateLimit` and
-    * `/events` behind `eventLimit`, then the HTML pages; anything unmatched
-    * gets the 404 page. A search refused by the [[SearchGate]] or cancelled by
-    * the statement timeout answers 503 with `Retry-After`. Responses are
-    * gzipped.
+  /** All routes: assets, then `/api` and `/mcp` behind `rateLimit`, `/events`
+    * behind `eventLimit` and `/status/report` behind `reportLimit`, then the
+    * HTML pages; anything unmatched gets the 404 page. A search refused by the
+    * [[SearchGate]] or cancelled by the statement timeout answers 503 with
+    * `Retry-After`. Responses are gzipped.
     */
   def httpApp(
       baseUrl: String,
@@ -83,16 +100,21 @@ object Main extends IOApp.Simple:
       live: ArtifactVersion => IO[LiveInfo],
       rateLimit: RateLimit,
       eventLimit: RateLimit,
-      log: SearchLog
+      log: SearchLog,
+      reports: ReportsApi
   ): HttpApp[IO] =
     val assets = Assets(devAssetsDir)
     val public = PublicRoutes(repo, baseUrl)
+    val status = StatusRoutes(reports.status, reports.interval, baseUrl)
+    val report =
+      ReportRoutes(reports.submit, reports.status, reports.interval, baseUrl)
     val limited = Router(
-      "/api" -> rateLimit(ApiRoutes(repo).routes),
+      "/api" -> rateLimit(ApiRoutes(repo).routes <+> status.api),
       "/mcp" -> rateLimit(Mcp(repo, live, version, log).routes),
-      "/events" -> eventLimit(EventRoutes(log).routes)
+      "/events" -> eventLimit(EventRoutes(log).routes),
+      "/status/report" -> reports.limit(report.routes)
     )
-    val routes = assets.routes <+> limited <+> public.routes
+    val routes = assets.routes <+> limited <+> public.routes <+> status.page
     // the Scala.js bundle and the HTML compress well (~900 KB -> ~200 KB JS)
     GZip(
       Kleisli(req =>
@@ -123,7 +145,10 @@ object Main extends IOApp.Simple:
       client: Client[IO],
       depsDev: DepsDev,
       ingest: IngestRepo,
-      config: IngestConfig
+      config: IngestConfig,
+      scheduler: Scheduler,
+      reports: Reports,
+      reportsConfig: ReportsConfig
   )(using Logger[IO]): IO[Unit] =
     val maven =
       MavenIndex(client, config.indexCacheDir.map(fs2.io.file.Path(_)))
@@ -136,14 +161,19 @@ object Main extends IOApp.Simple:
     // downloads from it per IP: once a day is plenty
     (Option
       .when(config.indexSyncEnabled)(
-        Scheduler.every("index-sync", 10.seconds, 24.hours)(sync.run)
+        scheduler.every("index-sync", 10.seconds, 24.hours)(sync.run)
       )
       .toList ++ List(
-      Scheduler.every("enrich", 1.minute, 15.minutes)(enrich.run),
-      Scheduler.every("freshness", 2.hours, 24.hours)(fresh.run),
+      scheduler.every("enrich", 1.minute, 15.minutes)(enrich.run),
+      scheduler.every("freshness", 2.hours, 24.hours)(fresh.run),
       // new versions bring new requirements; the first run reads them all
-      Scheduler.every("deps", 2.minutes, 1.hour)(deps.run),
-      Scheduler.every("first-releases", 3.minutes, 5.minutes)(firstReleases.run)
+      scheduler.every("deps", 2.minutes, 1.hour)(deps.run),
+      scheduler.every("first-releases", 3.minutes, 5.minutes)(
+        firstReleases.run
+      ),
+      scheduler.every("reports", 5.minutes, reportsConfig.interval)(
+        reports.run(reportsConfig.maxPerRun)
+      )
     )).parSequence_
 
   /** Runs `job` in the background when it is set up, else logs why it is off.
@@ -186,21 +216,48 @@ object Main extends IOApp.Simple:
             // a settled search at most every couple of seconds, plus clicks
             eventLimit <- Resource.eval(RateLimit(60, 1.minute))
             searchLog <- SearchLog.queued(SearchLog.writer(sessions))
-            _ <- Scheduler
-              .every("search-events", 10.minutes, 24.hours)(
-                SearchLog.prune(sessions, 90.days)
+            statusRepo = StatusRepo(sessions)
+            scheduler = Scheduler(statusRepo)
+            _ <- scheduler
+              .every("prune", 10.minutes, 24.hours)(
+                (
+                  SearchLog.prune(sessions, 90.days),
+                  statusRepo.prune(90.days)
+                ).mapN((a, b) => s"$a, $b")
               )
               .background
+            // a few reports a minute per visitor; the deps.dev checks behind
+            // them are also capped for everyone together (Reports)
+            reportLimit <- Resource.eval(RateLimit(5, 1.minute))
+            budget <- Resource.eval(Budget(config.reports.livePerHour, 1.hour))
+            slots <- Resource.eval(Semaphore[IO](2))
+            reports = Reports(
+              depsDev,
+              MavenRepo(client, MavenRepo.central),
+              ingest,
+              statusRepo,
+              budget,
+              slots,
+              config.reports.interval
+            )
             _ <- optional(
               Option.when(config.ingest.enabled)(
-                jobs(client, depsDev, ingest, config.ingest)
+                jobs(
+                  client,
+                  depsDev,
+                  ingest,
+                  config.ingest,
+                  scheduler,
+                  reports,
+                  config.reports
+                )
               ),
               "Maven/deps.dev ingestion disabled"
             )
             _ <- optional(
               config.search.githubToken.map(token =>
                 Throttle(1.second).flatMap(t =>
-                  Scheduler.every("github", 30.seconds, 1.hour)(
+                  scheduler.every("github", 30.seconds, 1.hour)(
                     GithubSync(GitHub(client, token.value, t), ingest).run
                   )
                 )
@@ -209,7 +266,7 @@ object Main extends IOApp.Simple:
             )
             _ <- optional(
               config.search.summaries.map(s =>
-                Scheduler.every("summaries", 3.minutes, 30.minutes)(
+                scheduler.every("summaries", 3.minutes, 30.minutes)(
                   SummaryJob(
                     Anthropic(plain, s.apiKey.value, s.model),
                     ingest,
@@ -221,7 +278,7 @@ object Main extends IOApp.Simple:
             )
             _ <- optional(
               embedder.map(e =>
-                Scheduler.every("embed", 45.seconds, 10.minutes)(
+                scheduler.every("embed", 45.seconds, 10.minutes)(
                   EmbedJob(e, ingest).run
                 )
               ),
@@ -239,7 +296,13 @@ object Main extends IOApp.Simple:
                   live,
                   rateLimit,
                   eventLimit,
-                  searchLog
+                  searchLog,
+                  ReportsApi(
+                    StatusRepo(web).status,
+                    reports.submit,
+                    config.reports.interval,
+                    reportLimit
+                  )
                 )
               )
               .build

@@ -17,16 +17,23 @@
 package com.softinio.scalapkg
 
 import cats.effect.IO
+import cats.effect.Ref
 import cats.effect.Resource
+import cats.effect.std.Semaphore
 import cats.syntax.all.*
 import com.softinio.scalapkg.db.Database
 import com.softinio.scalapkg.db.EventSource
+import com.softinio.scalapkg.db.IndexCursor
 import com.softinio.scalapkg.db.IngestRepo
 import com.softinio.scalapkg.db.NewerVersion
 import com.softinio.scalapkg.db.PackageRepo
 import com.softinio.scalapkg.db.PendingArtifact
 import com.softinio.scalapkg.db.SearchLog
 import com.softinio.scalapkg.db.SeenArtifact
+import com.softinio.scalapkg.db.PackageReport
+import com.softinio.scalapkg.db.ReportOutcome
+import com.softinio.scalapkg.db.ReportReason
+import com.softinio.scalapkg.db.StatusRepo
 import com.softinio.scalapkg.depsdev.DepsDev
 import com.softinio.scalapkg.depsdev.VersionInfo
 import com.softinio.scalapkg.domain.*
@@ -35,9 +42,13 @@ import com.softinio.scalapkg.ingest.DepsJob
 import com.softinio.scalapkg.ingest.Enrich
 import com.softinio.scalapkg.ingest.FirstReleases
 import com.softinio.scalapkg.ingest.Freshness
+import com.softinio.scalapkg.ingest.Budget
+import com.softinio.scalapkg.ingest.Reports
 import com.softinio.scalapkg.ingest.Throttle
+import com.softinio.scalapkg.maven.MavenRepo
 import munit.CatsEffectSuite
 import org.http4s.HttpApp
+import org.http4s.Method
 import org.http4s.Response
 import org.http4s.Status
 import org.http4s.Uri
@@ -536,6 +547,222 @@ class PackageRepoSuite extends CatsEffectSuite {
       yield
         assert(saved.isLeft)
         assertEquals(dangling, 0L)
+    }
+  }
+
+  test("job runs are recorded; a success clears the last failure") {
+    withDb { r =>
+      val status = StatusRepo(r.sessions)
+      for
+        _ <- status.started("test-job")
+        _ <- status.finished("test-job", Left("boom"))
+        failed <- status.status
+        _ <- status.finished("test-job", Right("did 3 things"))
+        ok <- status.status
+      yield
+        val f = failed.jobs.find(_.job == "test-job").getOrElse(fail("no run"))
+        assertEquals((f.error, f.okAt), (Some("boom"), None))
+        val o = ok.jobs.find(_.job == "test-job").getOrElse(fail("no run"))
+        assertEquals((o.error, o.summary), (None, Some("did 3 things")))
+        assert(o.okAt.isDefined)
+    }
+  }
+
+  test("the index is behind until Central's latest chunk is read") {
+    withDb { r =>
+      val status = StatusRepo(r.sessions)
+      val published = Instant.parse("2026-10-02T04:30:23Z")
+      for
+        _ <- r.ingest.saveCursor(IndexCursor("chain", 940))
+        _ <- r.ingest.noteRemote(IndexCursor("chain", 942, Some(published)))
+        behind <- status.status
+        // a later check that names no time keeps the one known
+        _ <- r.ingest.noteRemote(IndexCursor("chain", 942))
+        _ <- r.ingest.saveCursor(IndexCursor("chain", 942))
+        current <- status.status
+      yield
+        val b = behind.index.getOrElse(fail("no cursor"))
+        assertEquals((b.lastChunk, b.remoteLastChunk, b.caughtUp), (940, Some(942), false))
+        assertEquals(b.remotePublishedAt.map(_.toInstant), Some(published))
+        val c = current.index.getOrElse(fail("no cursor"))
+        assertEquals((c.remoteLastChunk, c.caughtUp), (Some(942), true))
+        assertEquals(c.remotePublishedAt.map(_.toInstant), Some(published))
+    }
+  }
+
+  test("a pending report is counted again instead of queued twice") {
+    withDb { r =>
+      val status = StatusRepo(r.sessions)
+      val report = PackageReport("io.queued", Some("queued_3"), "queued", ReportReason.Missing, None)
+      for
+        first <- status.enqueue(report, "queued")
+        second <- status.enqueue(report.copy(note = Some("still missing")), "queued")
+        pending <- status.isPending(report)
+        rows <- r.sessions.use(
+          _.execute(sql"SELECT reports, note FROM package_reports WHERE group_id = 'io.queued'".query(int4 *: text.opt))
+        )
+      yield
+        assertEquals((first, second, pending), (true, false, true))
+        assertEquals(rows, List((2, Some("still missing"))))
+    }
+  }
+
+  /** Reports against stubbed deps.dev and Central: `depsDev` and `central`
+    * map an artifact (`group:artifact`, or a Central path) to its body.
+    */
+  private def reports(
+      r: Repos,
+      depsDev: Map[String, String],
+      central: Map[String, String] = Map.empty,
+      live: Int = 100
+  ): IO[(Reports, IO[List[String]])] =
+    for
+      asked <- Ref[IO].of(Vector.empty[String])
+      throttle <- Throttle(0.millis)
+      depsDevApp = HttpApp[IO] { req =>
+        val path = req.uri.path.renderString.replace("%3A", ":")
+        asked.update(_ :+ path) *> IO.pure(
+          if req.method == Method.POST then Response[IO](Status.Ok).withEntity("""{"responses":[]}""")
+          else
+            depsDev
+              .collectFirst { case (name, body) if path.endsWith(name) => Response[IO](Status.Ok).withEntity(body) }
+              .getOrElse(Response[IO](Status.NotFound))
+        )
+      }
+      centralApp = HttpApp[IO] { req =>
+        val path = req.uri.path.renderString
+        asked.update(_ :+ s"central:$path") *> IO.pure(
+          central.get(path).fold(Response[IO](Status.NotFound))(Response[IO](Status.Ok).withEntity(_))
+        )
+      }
+      budget <- Budget(live, 1.hour)
+      slots <- Semaphore[IO](2)
+    yield (
+      Reports(
+        DepsDev(Client.fromHttpApp(depsDevApp), Uri.unsafeFromString("http://deps.test"), throttle),
+        MavenRepo(Client.fromHttpApp(centralApp), Uri.unsafeFromString("http://central.test/maven2")),
+        r.ingest,
+        StatusRepo(r.sessions),
+        budget,
+        slots,
+        6.hours
+      ),
+      asked.get.map(_.toList)
+    )
+
+  private def versionsJson(vs: (String, String)*): String =
+    vs.map((v, at) => s"""{"versionKey":{"version":"$v"},"publishedAt":"$at"}""").mkString("""{"versions":[""", ",", "]}")
+
+  test("a reported artifact deps.dev knows is added and searchable at once") {
+    withDb { r =>
+      val report = PackageReport("io.newlib", Some("newlib_3"), "newlib", ReportReason.Missing, None)
+      for
+        (checker, asked) <- reports(
+          r,
+          Map("io.newlib:newlib_3" -> versionsJson("1.0.0" -> "2026-10-10T00:00:00Z", "0.9.0" -> "2026-09-01T00:00:00Z"))
+        )
+        result <- checker.submit(report)
+        pkg <- r.search.get(PackageRef("io.newlib", "newlib"))
+        first <- firstRelease(r, ArtifactKey("io.newlib", "newlib_3"))
+        again <- checker.submit(report)
+        calls <- asked
+      yield
+        assertEquals(result.outcome, ReportOutcome.Added)
+        assertEquals(pkg.map(_.latestVersion), Some("1.0.0"))
+        assertEquals(first.map(_.toInstant), Some(Instant.parse("2026-09-01T00:00:00Z")))
+        // the same coordinate within the hour is answered from the database
+        assertEquals(again, result)
+        assert(calls.forall(!_.startsWith("central:")), calls)
+    }
+  }
+
+  test("a reported newer version advances the artifact, never moving it back") {
+    withDb { r =>
+      def at(d: String) = Some(Instant.parse(s"${d}T00:00:00Z"))
+      for
+        _ <- r.ingest.upsertSeen(
+          List(
+            SeenArtifact("io.bump", "bump_3", "bump", Target(Platform.Jvm, "3"), "1.0.0", at("2026-01-01")),
+            SeenArtifact("io.bump", "bump_2.13", "bump", Target(Platform.Jvm, "2.13"), "2.0.0", at("2026-02-01"))
+          )
+        )
+        (checker, _) <- reports(
+          r,
+          Map(
+            "io.bump:bump_3" -> versionsJson("1.1.0" -> "2026-10-01T00:00:00Z", "1.0.0" -> "2026-01-01T00:00:00Z"),
+            "io.bump:bump_2.13" -> versionsJson("1.9.0" -> "2025-01-01T00:00:00Z")
+          )
+        )
+        bumped <- checker.submit(PackageReport("io.bump", None, "bump", ReportReason.Version, None))
+        versions <- r.ingest.latestVersions(List(ArtifactKey("io.bump", "bump_3"), ArtifactKey("io.bump", "bump_2.13")))
+      yield
+        assertEquals(bumped.outcome, ReportOutcome.Updated)
+        assertEquals(
+          versions.map((k, v) => k.artifactId -> v._1),
+          Map("bump_3" -> "1.1.0", "bump_2.13" -> "2.0.0")
+        )
+    }
+  }
+
+  test("an indexed package reported missing is answered without asking anyone") {
+    withDb { r =>
+      for
+        (checker, asked) <- reports(r, Map.empty)
+        result <- checker.submit(PackageReport("io.circe", Some("circe-core_3"), "circe-core", ReportReason.Missing, None))
+        calls <- asked
+      yield
+        assertEquals(result.outcome, ReportOutcome.NoChange)
+        assertEquals(calls, Nil)
+    }
+  }
+
+  test("a Java artifact reported by name is not Scala") {
+    withDb { r =>
+      for
+        (checker, _) <- reports(r, Map("org.plain:plain-api" -> versionsJson("2.0.0" -> "2024-01-01T00:00:00Z")))
+        result <- checker.submit(PackageReport("org.plain", None, "plain-api", ReportReason.Missing, None))
+      yield assertEquals(result.outcome, ReportOutcome.NotScala)
+    }
+  }
+
+  test("what deps.dev does not know is queued, then found on Central by the job") {
+    withDb { r =>
+      val report = PackageReport("io.later", None, "later", ReportReason.Missing, Some("released yesterday"))
+      val metadata = "<metadata><versioning><versions><version>0.1.0</version></versions></versioning></metadata>"
+      for
+        (checker, asked) <- reports(
+          r,
+          Map.empty,
+          Map(
+            "/maven2/io/later/" -> """<a href="later_3/">later_3/</a> <a href="other_3/">other_3/</a>""",
+            "/maven2/io/later/later_3/maven-metadata.xml" -> metadata
+          )
+        )
+        submitted <- checker.submit(report)
+        again <- checker.submit(report)
+        beforeJob <- asked
+        summary <- checker.run(10)
+        versions <- r.ingest.latestVersions(List(ArtifactKey("io.later", "later_3")))
+        left <- StatusRepo(r.sessions).isPending(report)
+      yield
+        assertEquals((submitted.outcome, again.outcome), (ReportOutcome.Pending, ReportOutcome.Pending))
+        // a visitor's request never reaches Central
+        assert(beforeJob.forall(!_.startsWith("central:")), beforeJob)
+        assert(summary.contains("1 added"), summary)
+        assertEquals(versions.get(ArtifactKey("io.later", "later_3")).map(_._1), Some("0.1.0"))
+        assert(!left)
+    }
+  }
+
+  test("past the hourly budget a report is queued without a deps.dev call") {
+    withDb { r =>
+      for
+        (checker, asked) <- reports(r, Map("io.budget:budget_3" -> versionsJson("1.0.0" -> "2026-10-10T00:00:00Z")), live = 0)
+        result <- checker.submit(PackageReport("io.budget", Some("budget_3"), "budget", ReportReason.Missing, None))
+        calls <- asked
+      yield
+        assertEquals(result.outcome, ReportOutcome.Pending)
+        assertEquals(calls, Nil)
     }
   }
 

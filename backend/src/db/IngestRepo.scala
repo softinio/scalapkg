@@ -38,8 +38,13 @@ import java.time.ZoneOffset
 
 /** How far `IndexSync` has read the Maven index: the index chain (a new one
   * means Central rebuilt the index) and the last incremental chunk applied.
+  * Read from Central, `publishedAt` is when its latest chunk was published.
   */
-final case class IndexCursor(chainId: String, lastIncremental: Int)
+final case class IndexCursor(
+    chainId: String,
+    lastIncremental: Int,
+    publishedAt: Option[Instant] = None
+)
 
 /** A Scala artifact seen in the Maven index, with the version to record. */
 final case class SeenArtifact(
@@ -119,7 +124,7 @@ final class IngestRepo(sessions: Resource[IO, Session[IO]]):
       _.option(
         sql"SELECT chain_id, last_incremental FROM index_cursor"
           .query(text *: int4)
-          .to[IndexCursor]
+          .map((chain, last) => IndexCursor(chain, last))
       )
     )
 
@@ -132,6 +137,23 @@ final class IngestRepo(sessions: Resource[IO, Session[IO]]):
                 last_incremental = EXCLUDED.last_incremental,
                 updated_at = now()""".command,
       (c.chainId, c.lastIncremental)
+    )
+
+  /** Records that Central's index was just asked about, and when its latest
+    * chunk was published (kept when Central did not say). Nothing before the
+    * first cursor is saved.
+    */
+  def noteRemote(remote: IndexCursor): IO[Unit] =
+    run(
+      sql"""UPDATE index_cursor
+            SET remote_checked_at = now(),
+                remote_last_chunk = $int4,
+                remote_published_at = coalesce(${timestamptz.opt},
+                                               remote_published_at)""".command,
+      (
+        remote.lastIncremental,
+        remote.publishedAt.map(_.atOffset(ZoneOffset.UTC))
+      )
     )
 
   /** Each artifact's latest version and when it was released, if known. */

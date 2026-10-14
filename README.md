@@ -17,6 +17,9 @@ advisories from [deps.dev](https://deps.dev).
 There is also a JSON API (`/api/v1`), an Atom feed of new releases
 (`/feed.xml`) and an MCP server (`/mcp`) for AI assistants.
 
+See also [Scaladex](https://index.scala-lang.org), the Scala Center's official
+index of Scala libraries.
+
 ## How it works
 
 The package list comes from the Maven Central index, and deps.dev is polled
